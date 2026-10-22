@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS activity (
   id INTEGER PRIMARY KEY, at TEXT, actor INT, kind TEXT, entity TEXT, entity_id INT, text TEXT
 );
+CREATE TABLE IF NOT EXISTS sessions (
+  token TEXT PRIMARY KEY, user_id INT NOT NULL REFERENCES users(id), created_at TEXT, expires_at TEXT
+);
 CREATE TABLE IF NOT EXISTS learned (
   id INTEGER PRIMARY KEY, kind TEXT, token TEXT, value TEXT, created_at TEXT, UNIQUE(kind, token)
 );
@@ -89,9 +92,28 @@ def tx():
         conn.close()
 
 
+# Columns added after the first release. init() adds whichever are missing, so an
+# existing office database upgrades in place on the next start.
+MIGRATIONS = {
+    "users": {"email": "TEXT", "pw_hash": "TEXT", "perms": "TEXT DEFAULT '[]'", "active": "INT DEFAULT 1",
+              "must_change_pw": "INT DEFAULT 0", "phone": "TEXT"},
+    "documents": {"ocr_status": "TEXT DEFAULT ''", "hint_client_id": "INT", "source": "TEXT DEFAULT 'upload'"},
+    "messages": {"direction": "TEXT DEFAULT 'out'", "from_phone": "TEXT", "wa_message_id": "TEXT",
+                 "error": "TEXT", "sent_by": "INT"},
+}
+
+
 def init() -> None:
     with tx() as c:
         c.executescript(SCHEMA)
+        for table, cols in MIGRATIONS.items():
+            have = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+            for col, decl in cols.items():
+                if col not in have:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_user_email ON users(email) WHERE email IS NOT NULL")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_msg_wa ON messages(wa_message_id) WHERE wa_message_id IS NOT NULL")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_doc_ocr ON documents(ocr_status)")
 
 
 def rows(conn, sql, args=()) -> list[dict]:

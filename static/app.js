@@ -30,12 +30,14 @@ const store = {
 };
 const S = { boot: null, me: null, counts: {}, history: [] };
 
+const can = p => !!(S.me && S.me.perms && S.me.perms.includes(p));
+
 async function api(method, path, body, isForm) {
   const headers = {};
-  if (S.me) headers["X-User"] = S.me.id;
   if (body && !isForm) headers["Content-Type"] = "application/json";
-  const res = await fetch(path, { method, headers, body: isForm ? body : body ? JSON.stringify(body) : undefined });
+  const res = await fetch(path, { method, headers, credentials: "same-origin", body: isForm ? body : body ? JSON.stringify(body) : undefined });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && !path.startsWith("/api/auth/")) { showAuth(); throw new Error("Please sign in"); }
   if (!res.ok) {
     const d = data.detail;
     throw new Error(typeof d === "string" ? d : Array.isArray(d) ? d.map(x => x.msg).join("; ") : `Error ${res.status}`);
@@ -76,14 +78,18 @@ const NAV = [
 ];
 function renderNav() {
   const route = location.hash.slice(2).split("/")[0] || "today";
-  const badge = { inbox: S.counts.inbox, outbox: S.counts.outbox, calendar: S.counts.overrides };
+  const badge = { inbox: S.counts.inbox, outbox: (S.counts.outbox || 0) + (S.counts.replies || 0), calendar: S.counts.overrides };
   fill($("#nav"), ...NAV.map(([k, ico, label]) =>
     h("a", { href: `#/${k}`, class: route === k ? "on" : "" }, h("span", { class: "ico" }, ico), h("span", { class: "label" }, label),
       badge[k] ? h("span", { class: "badge" + (k === "outbox" ? " soft" : "") }, badge[k]) : null)));
   $("#firm-name").textContent = S.boot.firm_name;
-  const sel = h("select", { class: "input", onchange: e => { S.me = S.boot.users.find(u => u.id == e.target.value); store.set("me", S.me.id); boot(); } },
-    S.boot.users.map(u => h("option", { value: u.id, selected: u.id === S.me.id }, `${u.name} · ${u.role === "partner" ? "Partner" : "Staff"}`)));
-  fill($("#side-foot"), h("div", { class: "small muted", style: "margin-bottom:6px" }, "Working as"), sel);
+  fill($("#side-foot"),
+    h("div", { class: "who" }, h("span", { class: "avatar" }, initials(S.me.name)),
+      h("div", { class: "grow", style: "min-width:0" }, h("div", { class: "ellipsis", style: "font-weight:600" }, S.me.name),
+        h("div", { class: "small muted" }, S.me.role === "partner" ? "Partner" : "Staff"))),
+    h("div", { class: "row", style: "margin-top:8px" },
+      h("button", { class: "btn sm ghost", onclick: () => changePassword() }, "Password"),
+      h("button", { class: "btn sm ghost right", onclick: () => safely(async () => { await api("POST", "/api/auth/logout"); S.me = null; showAuth(); }) }, "Sign out")));
   const cur = S.boot.fys.find(f => f.current);
   fill($("#fy-chip"), h("a", { href: "#/calendar", class: "pill " + (cur.signed_off ? "approved" : "awaiting_docs") },
     cur.label, " · ", cur.signed_off ? "calendar signed off ✓" : "calendar needs partner sign-off"));
@@ -161,7 +167,7 @@ function obligationRow(o, after, opts = {}) {
   const wrap = h("div", { class: "item" });
   const days = o.days_left, r = rel(days);
   const done = ["filed", "na"].includes(o.status);
-  const mine = o.next_action && (o.next_action.role === S.me.role || S.me.role === "partner");
+  const mine = o.next_action && (o.next_action.role !== "partner" || can("approve"));
   const primary = o.next_action && !done
     ? h("button", { class: "btn sm " + (mine ? "primary" : ""), disabled: !mine || null, title: mine ? "" : "Needs a partner",
         onclick: e => { e.stopPropagation(); act(o, o.next_action.key, after); } }, o.next_action.label)
@@ -191,9 +197,9 @@ function obligationRow(o, after, opts = {}) {
         opts.hideClient ? null : h("a", { class: "btn sm", href: `#/clients/${o.client_id}` }, "Open client"),
         o.missing.length && !done && o.stage !== "upcoming" ? h("button", { class: "btn sm", onclick: () => openChase(o.client_id, after) }, "Ask client") : null,
         o.status === "open" && o.stage !== "ready" ? h("button", { class: "btn sm", onclick: () => act(o, "start", after) }, "Start anyway") : null,
-        S.me.role === "partner" && ["review", "approved"].includes(o.status) ? h("button", { class: "btn sm", onclick: () => act(o, "send_back", after) }, "Send back") : null,
-        S.me.role === "partner" && !done ? h("button", { class: "btn sm ghost", onclick: () => act(o, "mark_na", after) }, "Not applicable") : null,
-        S.me.role === "partner" && done ? h("button", { class: "btn sm ghost", onclick: () => act(o, "reopen", after) }, "Reopen") : null,
+        can("approve") && ["review", "approved"].includes(o.status) ? h("button", { class: "btn sm", onclick: () => act(o, "send_back", after) }, "Send back") : null,
+        can("approve") && !done ? h("button", { class: "btn sm ghost", onclick: () => act(o, "mark_na", after) }, "Not applicable") : null,
+        can("approve") && done ? h("button", { class: "btn sm ghost", onclick: () => act(o, "reopen", after) }, "Reopen") : null,
         h("select", { class: "input right", style: "width:auto", onchange: e => safely(async () => {
           await api("POST", `/api/obligations/${o.id}/assign`, { assignee_id: e.target.value ? +e.target.value : null });
           toast("Reassigned"); after && after();
@@ -214,19 +220,27 @@ function openMessage(m, after) {
   const ta = h("textarea", { class: "input msg-body", rows: 14 }, m.body);
   const save = () => api("POST", `/api/messages/${m.id}`, { action: "save", body: ta.value });
   const sent = async () => { await api("POST", `/api/messages/${m.id}`, { action: "sent", body: ta.value }); closeDrawer(); toast("Marked as sent"); refreshCounts(); after && after(); };
+  const viaApi = async () => safely(async () => {
+    await api("POST", `/api/messages/${m.id}`, { action: "send_whatsapp", body: ta.value });
+    closeDrawer(); toast("Sent on WhatsApp"); refreshCounts(); after && after();
+  });
+  const mayDo = can("send_messages");
   drawer(`Document request · ${m.client_name}`, [
-    h("div", { class: "hint" }, "Nothing is sent automatically. Edit if you like, then send from your own WhatsApp or email."),
+    h("div", { class: "hint" }, "Nothing is sent automatically. Edit if you like, then send."),
+    m.api_send && !m.window_open ? h("div", { class: "banner warn", style: "margin:0" }, "This client hasn't messaged in 24 h — WhatsApp only allows an approved template from the office number. “Open WhatsApp” sends from your phone instead.") : null,
+    mayDo ? null : h("div", { class: "banner warn", style: "margin:0" }, "You can edit this draft; someone with permission to message clients will send it."),
     ta,
     h("div", { class: "small muted" }, m.phone ? `WhatsApp: +91 ${m.phone}` : "No phone on file", " · ", m.email || "no email on file"),
   ], [
     h("button", { class: "btn danger ghost", onclick: async () => { await api("POST", `/api/messages/${m.id}`, { action: "discard" }); closeDrawer(); refreshCounts(); after && after(); } }, "Discard"),
     h("button", { class: "btn", onclick: async () => { await navigator.clipboard.writeText(ta.value).catch(() => {}); await save(); toast("Copied"); } }, "Copy"),
     m.email ? h("button", { class: "btn", onclick: async () => { await save(); location.href = `mailto:${m.email}?subject=${encodeURIComponent(m.subject || "")}&body=${encodeURIComponent(ta.value)}`; } }, "Email") : null,
-    m.phone ? h("button", { class: "btn primary", onclick: async () => {
+    m.phone && mayDo ? h("button", { class: "btn" + (m.api_send ? "" : " primary"), onclick: async () => {
       await save(); window.open(`https://wa.me/91${m.phone}?text=${encodeURIComponent(ta.value)}`, "_blank");
       if (confirm("Did the WhatsApp message go out?")) sent();
     } }, "Open WhatsApp") : null,
-    h("button", { class: "btn" + (m.phone ? "" : " primary"), onclick: sent }, "Mark sent"),
+    m.api_send && mayDo ? h("button", { class: "btn primary", onclick: viaApi }, "Send on WhatsApp") : null,
+    mayDo ? h("button", { class: "btn" + (m.phone ? "" : " primary"), onclick: sent }, "Mark sent") : h("button", { class: "btn primary", onclick: async () => { await save(); closeDrawer(); toast("Draft saved"); } }, "Save draft"),
   ]);
 }
 
@@ -236,7 +250,7 @@ async function viewToday(page) {
   if (!S.boot.has_clients) return viewWelcome(page);
   const filter = store.get("todayFilter", null);
   const c = d.counts;
-  const mineFirst = S.me.role === "partner" ? c.review : c.ready + c.in_progress + c.approved;
+  const mineFirst = can("approve") ? c.review : c.ready + c.in_progress + c.approved;
   const stats = [
     ["overdue", "red", c.overdue, "Overdue"], ["week", "amber", c.week, "Due in 7 days"],
     ["awaiting_docs", "", c.awaiting_docs, "Waiting on clients"], ["ready", "blue", c.ready + c.in_progress, "Ready / preparing"],
@@ -246,11 +260,11 @@ async function viewToday(page) {
     : filter === "ready" ? ["ready", "in_progress"].includes(o.stage) : o.stage === filter;
   const items = d.items.filter(match);
   const groups = [];
-  if (S.me.role === "partner" && !filter) {
+  if (can("approve") && !filter) {
     const r = items.filter(o => o.stage === "review");
     if (r.length) groups.push(["Needs your approval", r]);
   }
-  const rest = items.filter(o => !(S.me.role === "partner" && !filter && o.stage === "review"));
+  const rest = items.filter(o => !(can("approve") && !filter && o.stage === "review"));
   groups.push(["Overdue", rest.filter(o => o.days_left < 0)], ["This week", rest.filter(o => o.days_left >= 0 && o.days_left <= 7)],
     ["Next 30 days", rest.filter(o => o.days_left > 7)]);
   const rerender = () => route();
@@ -285,24 +299,46 @@ function viewWelcome(page) {
     h("div", { class: "row", style: "justify-content:center" },
       h("a", { class: "btn primary", href: "#/clients/new" }, "+ Add first client"),
       h("a", { class: "btn", href: "#/clients/bulk" }, "Paste client list"),
-      h("button", { class: "btn ghost", onclick: () => safely(async () => { await api("POST", "/api/demo"); toast("Demo office loaded"); boot(); }) }, "Try with demo data"))));
+      S.boot.can_load_demo ? h("button", { class: "btn ghost", onclick: () => safely(async () => {
+        const r = await api("POST", "/api/demo"); toast("Demo office loaded"); await boot();
+        if (r.logins.length) drawer("Demo team logins", [h("div", { class: "hint" }, "Sign in as these people in another browser to see the office from their side. Priya only sees clients assigned to her."),
+          h("table", { class: "table" }, r.logins.map(l => h("tr", {}, h("td", {}, h("b", {}, l.name), h("div", { class: "small muted" }, l.role)), h("td", {}, l.email), h("td", {}, h("code", {}, l.password)))))]);
+      }) }, "Try with demo data") : null)));
 }
 
 // ----------------------------------------------------------------- INBOX
+function uploadXHR(fd, onProgress) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open("POST", "/api/upload");
+    x.upload.onprogress = e => e.lengthComputable && onProgress(e.loaded / e.total);
+    x.onload = () => {
+      let data = {}; try { data = JSON.parse(x.responseText); } catch { /* non-JSON error page */ }
+      if (x.status === 401) { showAuth(); return reject(new Error("Please sign in")); }
+      x.status < 300 ? resolve(data) : reject(new Error(typeof data.detail === "string" ? data.detail : `Upload failed (${x.status})`));
+    };
+    x.onerror = () => reject(new Error("Network error during upload — nothing was lost, try again"));
+    x.send(fd);
+  });
+}
+
 async function upload(files, clientId) {
   if (!files.length) return;
   const fd = new FormData();
-  for (const f of files) fd.append("files", f, f.webkitRelativePath || f.name);
+  let bytes = 0;
+  for (const f of files) { fd.append("files", f, f.webkitRelativePath || f.name); bytes += f.size; }
   if (clientId) fd.append("client_id", clientId);
-  toast(`Reading ${files.length} file${files.length === 1 ? "" : "s"}…`);
-  return safely(async () => {
-    const r = await api("POST", "/api/upload", fd, true);
+  const bar = h("i", { style: "width:0%" });
+  const label = h("span", {}, `Uploading ${files.length} file${files.length === 1 ? "" : "s"} (${(bytes / 1048576).toFixed(1)} MB)…`);
+  const box = h("div", { class: "uploading card pad" }, label, h("div", { class: "progress", style: "margin-top:8px" }, bar));
+  document.body.append(box);
+  try {
+    const r = await uploadXHR(fd, p => { bar.style.width = `${Math.round(p * 100)}%`; if (p >= 1) label.textContent = "Sorting files…"; });
     store.set("lastBatch", r);
-    toast(`${r.auto} filed automatically${r.review ? ` · ${r.review} need a look` : ""}${r.duplicates ? ` · ${r.duplicates} already had` : ""}`);
-    if (!clientId) location.hash = "#/inbox"; else route();
-    route();
+    toast(`${r.auto} filed automatically${r.review ? ` · ${r.review} need a look` : ""}${r.reading ? ` · reading ${r.reading} scan${r.reading > 1 ? "s" : ""}` : ""}${r.duplicates ? ` · ${r.duplicates} already had` : ""}`);
+    if (!clientId && !location.hash.startsWith("#/inbox")) location.hash = "#/inbox"; else route();
     return r;
-  });
+  } catch (e) { toast(e.message, true); } finally { box.remove(); }
 }
 
 function periodPicker(d) {
@@ -325,7 +361,9 @@ function periodPicker(d) {
 
 async function viewInbox(page) {
   const [review, clients] = await Promise.all([api("GET", "/api/documents?status=needs_review"), api("GET", "/api/clients")]);
-  await refreshCounts();
+  const counts = (await refreshCounts()).counts;
+  clearTimeout(S.poll);
+  if (counts.reading) S.poll = setTimeout(() => { if (location.hash.startsWith("#/inbox")) route(); }, 3000);
   const last = store.get("lastBatch", null);
   const drop = h("div", { class: "drop", onclick: () => $("#file-input").click() },
     h("div", { class: "big" }, "⇪"), h("h2", {}, "Drop everything here"),
@@ -341,11 +379,13 @@ async function viewInbox(page) {
     const cSel = h("select", { class: "input" }, h("option", { value: "" }, "Which client?"), clients.map(c => h("option", { value: c.id, selected: c.id === d.client_id }, c.name)));
     const tSel = h("select", { class: "input" }, Object.entries(S.boot.doc_types).map(([k, l]) => h("option", { value: k, selected: k === d.doc_type }, l)));
     const per = periodPicker(d);
-    const row = h("div", { class: "rv" },
+    const reading = ["pending", "running"].includes(d.ocr_status);
+    const row = h("div", { class: "rv" + (reading ? " reading" : "") },
       h("div", {},
         h("a", { href: `/api/documents/${d.id}/file`, target: "_blank", class: "t1 ellipsis", style: "display:block;font-weight:600" }, d.filename.split("/").pop()),
         h("div", { class: "small muted ellipsis" }, d.reasons.filter(r => /No |Could not|Partial|please|Assumed|Wide/.test(r)).join(" · ") || d.reasons.join(" · ")),
-        h("div", { class: "conf" }, h("i", { style: `width:${Math.round(d.confidence * 100)}%` }))),
+        reading ? h("div", { class: "small", style: "color:var(--brand)" }, "🔎 Reading the scan…") : h("div", { class: "conf" }, h("i", { style: `width:${Math.round(d.confidence * 100)}%` })),
+        d.source === "whatsapp" ? h("span", { class: "pill auth", style: "margin-top:4px" }, "via WhatsApp") : null),
       h("label", { class: "field" }, "Client", cSel),
       h("label", { class: "field" }, "Document", tSel),
       h("label", { class: "field" }, "Period (from · to)", per.el),
@@ -364,10 +404,12 @@ async function viewInbox(page) {
     h("div", { class: "row" }, h("h1", { class: "grow" }, "Inbox")),
     h("p", { class: "muted" }, "Everything clients send lands here first."),
     drop,
+    counts.reading ? h("div", { class: "banner ok", style: "margin-top:16px" }, `🔎 Reading ${counts.reading} scanned page${counts.reading > 1 ? "s" : ""}… files will sort themselves as soon as the text is in.`) : null,
     last ? h("div", { class: "card pad", style: "margin-top:16px" },
       h("div", { class: "row" }, h("b", {}, `Last upload: ${last.total} files`), h("span", { class: "muted right small" }, `${last.auto} auto-filed · ${last.review} to check · ${last.duplicates} duplicates`)),
       h("div", { class: "progress", style: "margin-top:8px" }, h("i", { style: `width:${last.total ? Math.round(100 * (last.auto + last.duplicates) / last.total) : 0}%` })),
-      last.skipped && last.skipped.length ? h("div", { class: "small muted", style: "margin-top:6px" }, "Skipped: ", last.skipped.map(s => `${s.filename} (${s.reason})`).join(", ")) : null) : null,
+      last.skipped && last.skipped.length ? h("details", { style: "margin-top:8px" }, h("summary", { class: "small" }, `${last.skipped.length} skipped — see why`),
+        h("ul", { class: "small muted" }, last.skipped.slice(0, 50).map(s => h("li", {}, h("b", {}, s.filename.split("/").pop()), " — ", s.reason)))) : null) : null,
     h("div", { class: "group", style: "margin-top:22px" },
       h("div", { class: "row" }, h("h3", {}, "Needs a quick look"), h("span", { class: "muted small" }, review.length)),
       review.length ? h("div", { class: "card" }, rows) : h("div", { class: "card empty" }, h("div", { class: "big" }, "✓"), "Every file is sorted.")),
@@ -402,7 +444,7 @@ async function viewCalendar(page) {
     h("p", { class: "muted" }, "Built from each client's profile for ", S.boot.fys.map(f => f.label).join(" and "), ". Statutory dates by default — government extensions are added below and need a partner's OK."),
     fyNow.signed_off ? h("div", { class: "banner ok" }, `✓ ${fyNow.label} calendar signed off by a partner.`)
       : h("div", { class: "banner warn" }, h("span", { class: "grow" }, `${fyNow.label} calendar hasn't been reviewed by a partner yet. Check due dates and any extensions, then sign off.`),
-        S.me.role === "partner" ? h("button", { class: "btn primary", onclick: () => safely(async () => { await api("POST", `/api/calendar/${fyNow.fy}/signoff`); toast("Signed off"); await boot(); }) }, "Sign off") : null),
+        can("approve") ? h("button", { class: "btn primary", onclick: () => safely(async () => { await api("POST", `/api/calendar/${fyNow.fy}/signoff`); toast("Signed off"); await boot(); }) }, "Sign off") : null),
     h("div", { class: "cal" }, cells),
     h("div", { class: "group", style: "margin-top:26px" },
       h("div", { class: "row" }, h("h3", { class: "grow" }, "Due-date extensions"),
@@ -415,13 +457,13 @@ async function viewCalendar(page) {
           h("td", {}, o.fy_label, o.period_key === "*" ? "" : ` · ${o.period_key}`),
           h("td", {}, fmtDate(o.new_due, true)), h("td", { class: "hide-sm small" }, o.reason),
           h("td", {}, o.status === "proposed"
-            ? (S.me.role === "partner" ? h("div", { class: "row" },
+            ? (can("approve") ? h("div", { class: "row" },
               h("button", { class: "btn sm primary", onclick: () => safely(async () => { await api("POST", `/api/overrides/${o.id}/approve`); toast("Calendar updated"); route(); }) }, "Approve"),
               h("button", { class: "btn sm ghost", onclick: () => safely(async () => { await api("POST", `/api/overrides/${o.id}/reject`); route(); }) }, "Reject"))
               : h("span", { class: "pill review" }, "Awaiting partner"))
             : h("span", { class: "pill " + (o.status === "approved" ? "approved" : "na") }, o.status)))))) : h("div", { class: "card empty" }, "No extensions recorded.")),
   );
-  if (pending.length && S.me.role === "partner") toast(`${pending.length} extension${pending.length > 1 ? "s" : ""} waiting for your approval`);
+  if (pending.length && can("approve")) toast(`${pending.length} extension${pending.length > 1 ? "s" : ""} waiting for your approval`);
 }
 
 function showDay(key, g) {
@@ -460,7 +502,8 @@ async function viewClients(page) {
         h("td", { class: "hide-sm small" }, c.pan || "—", h("div", { class: "muted" }, c.gstin || "")),
         h("td", {}, c.overdue ? h("span", { class: "pill awaiting_docs", style: "background:var(--red-soft);color:var(--red)" }, `${c.overdue} overdue`) : null, " ",
           c.awaiting_docs ? h("span", { class: "pill awaiting_docs" }, `${c.awaiting_docs} waiting on docs`) : null,
-          !c.overdue && !c.awaiting_docs ? h("span", { class: "small muted" }, "On track") : null),
+          !c.overdue && !c.awaiting_docs ? h("span", { class: "small muted" }, "On track") : null,
+          c.replies ? h("span", { class: "pill review", style: "margin-left:4px" }, `💬 ${c.replies}`) : null),
         h("td", { class: "hide-sm" }, c.next_due ? fmtDate(c.next_due) : "—"),
         h("td", { class: "hide-sm small muted" }, `${c.docs} files`))));
   };
@@ -468,7 +511,9 @@ async function viewClients(page) {
   draw();
   fill(page, 
     h("div", { class: "row wrap" }, h("h1", { class: "grow" }, "Clients"), q,
-      h("a", { class: "btn", href: "#/clients/bulk" }, "Paste list"), h("a", { class: "btn primary", href: "#/clients/new" }, "+ Client")),
+      can("export") && clients.length ? h("a", { class: "btn", href: "/api/export", title: "Every client's files as one organised zip" }, "⇩ Zip all") : null,
+      can("manage_clients") ? h("a", { class: "btn", href: "#/clients/bulk" }, "Paste list") : null,
+      can("manage_clients") ? h("a", { class: "btn primary", href: "#/clients/new" }, "+ Client") : null),
     h("div", { class: "card", style: "margin-top:16px;overflow:auto" }, h("table", { class: "table" },
       h("thead", {}, h("tr", {}, h("th", {}, "Client"), h("th", { class: "hide-sm" }, "PAN / GSTIN"), h("th", {}, "Health"), h("th", { class: "hide-sm" }, "Next due"), h("th", { class: "hide-sm" }, "Vault"))),
       body)),
@@ -579,7 +624,9 @@ async function viewClient(page, id) {
   const reload = () => route();
   const open = d.obligations.filter(o => !["filed", "na"].includes(o.status));
   const done = d.obligations.filter(o => ["filed", "na"].includes(o.status)).reverse();
-  const tabs = [["filings", `Filings (${open.length})`], ["vault", "Document vault"], ["history", `Filed (${done.length})`], ["activity", "Activity"]];
+  const unread = d.conversation.filter(m => m.direction === "in" && m.status === "received").length;
+  const tabs = [["filings", `Filings (${open.length})`], ["vault", "Document vault"], ["history", `Filed (${done.length})`],
+    ["messages", `Messages${unread ? ` (${unread} new)` : ""}`], ["activity", "Activity"]];
   const up = h("input", { type: "file", multiple: true, class: "hidden", onchange: e => upload([...e.target.files], c.id) });
   let content;
   if (tab === "filings") {
@@ -591,6 +638,11 @@ async function viewClient(page, id) {
       laterBox);
   }
   if (tab === "history") content = done.length ? h("div", { class: "card list" }, done.map(o => obligationRow(o, reload, { hideClient: true }))) : h("div", { class: "card empty" }, "Nothing filed yet.");
+  if (tab === "messages") content = h("div", { class: "card pad convo" }, d.conversation.length ? d.conversation.slice().reverse().map(m =>
+    h("div", { class: "bubble " + (m.direction === "in" ? "in" : "out") },
+      h("div", {}, m.body), h("div", { class: "small muted" }, (m.sent_at || m.created_at).replace("T", " ").slice(0, 16), m.direction === "out" ? ` · ${m.status}` : ""))) :
+    h("span", { class: "muted" }, "No messages yet. Client replies on the office WhatsApp number show up here, and their attachments are filed automatically."));
+  if (tab === "messages" && unread) d.conversation.filter(m => m.direction === "in" && m.status === "received").forEach(m => api("POST", `/api/messages/${m.id}`, { action: "read" }).catch(() => {}));
   if (tab === "activity") content = h("div", { class: "card pad" }, d.activity.length ? d.activity.map(a => h("div", { class: "small", style: "padding:5px 0;border-bottom:1px solid var(--line)" },
     h("span", { class: "muted" }, a.at.replace("T", " ").slice(0, 16), " · "), a.text)) : h("span", { class: "muted" }, "No activity yet."));
   if (tab === "vault") content = h("div", {}, d.unsorted.length ? h("div", { class: "banner warn" }, `${d.unsorted.length} file(s) for this client need a look in the Inbox.`, h("a", { class: "btn sm right", href: "#/inbox" }, "Open Inbox")) : null,
@@ -609,7 +661,8 @@ async function viewClient(page, id) {
       up,
       h("button", { class: "btn", onclick: () => up.click() }, "⇪ Add files"),
       h("button", { class: "btn", onclick: () => openChase(c.id, reload) }, "✉ Ask for documents"),
-      h("button", { class: "btn", onclick: () => clientForm(c, reload) }, "Edit")),
+      can("export") ? h("a", { class: "btn", href: `/api/clients/${c.id}/export`, title: "All files, sorted by FY and document type, with an index and the filing register" }, "⇩ Download zip") : null,
+      can("manage_clients") ? h("button", { class: "btn", onclick: () => clientForm(c, reload) }, "Edit") : null),
     h("div", { class: "tabs" }, tabs.map(([k, l]) => h("button", { class: tab === k ? "on" : "", onclick: () => { store.set("clientTab", k); reload(); } }, l))),
     content);
 }
@@ -625,48 +678,168 @@ function showDocs(label, docs) {
 async function viewOutbox(page) {
   const msgs = await api("GET", "/api/messages");
   await refreshCounts();
+  const inbound = msgs.filter(m => m.direction === "in" && m.status === "received");
+  const out = msgs.filter(m => m.direction === "out");
+  const markRead = m => safely(async () => { await api("POST", `/api/messages/${m.id}`, { action: "read" }); route(); });
   fill(page, h("h1", {}, "Outbox"),
-    h("p", { class: "muted" }, "Document requests drafted by the brain. Nothing leaves the office until someone here sends it."),
-    msgs.length ? h("div", { class: "card list" }, msgs.map(m => h("div", { class: "item", style: "grid-template-columns:44px 1fr auto auto", onclick: () => openMessage(m, route) },
-      h("div", { class: "avatar" }, initials(m.client_name)),
-      h("div", { class: "grow" }, h("div", { class: "t1" }, m.client_name), h("div", { class: "t2 ellipsis" }, m.body.split("\n").filter(l => l.startsWith("•")).join("  "))),
-      h("span", { class: "pill " + (m.status === "sent" ? "filed" : m.status === "approved" ? "ready" : "awaiting_docs") }, m.status === "sent" ? `Sent ${m.sent_at.slice(5, 10).split("-").reverse().join("/")}` : m.status === "approved" ? "Approved" : "Draft"),
-      h("span", { class: "small muted" }, m.created_at.slice(0, 10))))) : h("div", { class: "card empty" }, h("div", { class: "big" }, "✉"), "No drafts. Use “Ask client” on any filing."));
+    h("p", { class: "muted" }, "Document requests drafted by the brain, and what clients wrote back. Nothing leaves the office until someone here sends it.",
+      S.boot.whatsapp ? " WhatsApp Business is connected — client replies and attachments arrive here automatically." : ""),
+    inbound.length ? h("div", { class: "group" }, h("div", { class: "row" }, h("h3", {}, "New from clients"), h("span", { class: "muted small" }, inbound.length)),
+      h("div", { class: "card list" }, inbound.map(m => h("div", { class: "item", style: "grid-template-columns:44px 1fr auto auto" },
+        h("div", { class: "avatar" }, initials(m.client_name || "?")),
+        h("div", { class: "grow" }, h("div", { class: "t1" }, m.client_name || `+91 ${m.from_phone} (not a client yet)`), h("div", { class: "t2" }, m.body)),
+        m.client_id ? h("a", { class: "btn sm", href: `#/clients/${m.client_id}` }, "Open") : h("a", { class: "btn sm", href: "#/inbox" }, "Inbox"),
+        h("button", { class: "btn sm ghost", onclick: e => { e.stopPropagation(); markRead(m); } }, "Done"))))) : null,
+    h("div", { class: "group" }, h("h3", { style: "margin-bottom:8px" }, "Requests to clients"),
+      out.length ? h("div", { class: "card list" }, out.map(m => h("div", { class: "item", style: "grid-template-columns:44px 1fr auto auto", onclick: () => openMessage(m, route) },
+        h("div", { class: "avatar" }, initials(m.client_name || "?")),
+        h("div", { class: "grow" }, h("div", { class: "t1" }, m.client_name), h("div", { class: "t2 ellipsis" }, (m.body || "").split("\n").filter(l => l.startsWith("•")).join("  "))),
+        h("span", { class: "pill " + (m.status === "sent" ? "filed" : "awaiting_docs") }, m.status === "sent" ? `Sent ${m.sent_at.slice(5, 10).split("-").reverse().join("/")}` : "Draft"),
+        h("span", { class: "small muted" }, m.created_at.slice(0, 10))))) : h("div", { class: "card empty" }, h("div", { class: "big" }, "✉"), "No drafts. Use “Ask client” on any filing.")));
 }
 
 // -------------------------------------------------------------- SETTINGS
 async function viewSettings(page) {
-  const [rules, act] = await Promise.all([api("GET", "/api/rules"), api("GET", "/api/activity")]);
-  const isP = S.me.role === "partner";
-  const firm = h("input", { class: "input", value: S.boot.firm_name, disabled: !isP || null });
-  const start = h("input", { class: "input", type: "date", value: S.boot.tracking_start, disabled: !isP || null });
-  const uName = h("input", { class: "input", placeholder: "Name" });
-  const uRole = h("select", { class: "input", style: "width:auto" }, h("option", { value: "staff" }, "Staff"), h("option", { value: "partner" }, "Partner"));
+  const [rules, act, users] = await Promise.all([api("GET", "/api/rules"), api("GET", "/api/activity"), api("GET", "/api/users")]);
+  const admin = can("manage_team");
+  const firm = h("input", { class: "input", value: S.boot.firm_name, disabled: !admin || null });
+  const start = h("input", { class: "input", type: "date", value: S.boot.tracking_start, disabled: !admin || null });
+  const hook = `${location.origin}/api/whatsapp/webhook`;
+  const yes = (ok, a, b) => h("div", { class: "small", style: "padding:3px 0" }, ok ? "✓ " : "○ ", ok ? a : b);
   fill(page, h("h1", {}, "Settings"),
     h("div", { class: "grid2", style: "margin-top:16px;align-items:start" },
       h("div", { class: "card pad" }, h("h2", {}, "Office"),
         h("label", { class: "field" }, "Firm name (used in client messages)", firm),
         h("label", { class: "field", style: "margin-top:10px" }, "Track filings due from (older ones are treated as already handled)", start),
-        isP ? h("button", { class: "btn primary", style: "margin-top:10px", onclick: () => safely(async () => { await api("POST", "/api/settings", { firm_name: firm.value, tracking_start: start.value || null }); toast("Saved"); boot(); }) }, "Save") : h("div", { class: "small muted" }, "Partners can edit."),
-        h("h2", { style: "margin-top:18px" }, "Team"),
-        S.boot.users.map(u => h("div", { class: "who", style: "padding:4px 0" }, h("span", { class: "avatar" }, initials(u.name)), u.name, h("span", { class: "pill auth right" }, u.role))),
-        isP ? h("div", { class: "row", style: "margin-top:8px" }, uName, uRole, h("button", { class: "btn", onclick: () => safely(async () => { await api("POST", "/api/users", { name: uName.value, role: uRole.value }); toast("Added"); boot(); }) }, "Add")) : null),
-      h("div", { class: "card pad" }, h("h2", {}, "AI assistant"),
-        h("p", { class: "small" }, S.boot.llm ? "✓ Connected. The command bar answers free-form questions with Claude; every change it suggests still needs a click."
-          : "Running on built-in rules (works offline). Set ANTHROPIC_API_KEY on the server to unlock free-form questions."),
-        h("h2", { style: "margin-top:18px" }, "Human-in-the-loop guardrails"),
-        h("ul", { class: "small", style: "padding-left:18px;margin:0" },
-          h("li", {}, "Low-confidence files go to the Inbox; nothing is guessed silently."),
-          h("li", {}, "Only partners approve filings, extensions, N/A and reopenings."),
-          h("li", {}, "A filing can't be marked filed without an acknowledgement number."),
-          h("li", {}, "Client messages are drafts until a person sends them."),
-          h("li", {}, "Every action is in the activity log.")))),
-    h("div", { class: "group", style: "margin-top:22px" }, h("h3", { style: "margin-bottom:8px" }, "Compliance rules in the calendar"),
+        admin ? h("button", { class: "btn primary", style: "margin-top:10px", onclick: () => safely(async () => { await api("POST", "/api/settings", { firm_name: firm.value, tracking_start: start.value || null }); toast("Saved"); boot(); }) }, "Save")
+          : h("div", { class: "small muted", style: "margin-top:8px" }, "Only people who manage the team can change these.")),
+      h("div", { class: "card pad" }, h("h2", {}, "Connections"),
+        yes(S.boot.llm, "AI command bar connected (Claude). Every change it suggests still needs a click.", "AI command bar: built-in rules only. Set ANTHROPIC_API_KEY for free-form questions."),
+        yes(S.boot.ocr.tesseract, "Scanned documents are read on this server (Tesseract).", "Tesseract not installed — scans are sorted by file name only."),
+        yes(S.boot.ocr.vision, "Hard-to-read scans fall back to Claude vision (sends the file to Anthropic).", "Claude vision OCR off (set CABOT_VISION_OCR=1 to enable)."),
+        yes(S.boot.whatsapp, "WhatsApp Business connected — replies and attachments flow in automatically.", "WhatsApp Business not connected — use “Open WhatsApp” links."),
+        h("div", { class: "small muted", style: "margin-top:6px" }, "WhatsApp webhook URL for Meta: ", h("code", {}, hook)))),
+    h("div", { class: "group", style: "margin-top:22px" },
+      h("div", { class: "row" }, h("h3", { class: "grow" }, "Team & permissions"),
+        admin ? h("button", { class: "btn sm primary", onclick: inviteUser }, "+ Invite") : null),
+      h("div", { class: "card", style: "overflow:auto;margin-top:8px" }, h("table", { class: "table" },
+        h("tr", {}, h("th", {}, "Person"), h("th", {}, "Role"), Object.keys(S.boot.perms).map(k => h("th", { class: "hide-sm", title: S.boot.perms[k], style: "text-align:center" }, PERM_SHORT[k])), h("th", {}, "")),
+        users.map(u => teamRow(u, admin)))),
+      h("div", { class: "small muted", style: "margin-top:6px" }, "Partners always have every permission. Hover a column for details.")),
+    h("div", { class: "group" }, h("h3", { style: "margin-bottom:8px" }, "Compliance rules in the calendar"),
       h("div", { class: "card", style: "overflow:auto" }, h("table", { class: "table" },
         h("tr", {}, h("th", {}, "Compliance"), h("th", {}, "Authority"), h("th", { class: "hide-sm" }, "Notes")),
         rules.map(r => h("tr", {}, h("td", {}, h("b", {}, r.name)), h("td", {}, r.authority), h("td", { class: "small muted hide-sm" }, r.help, r.penalty ? ` Penalty: ${r.penalty}` : "")))))),
     h("div", { class: "group" }, h("h3", { style: "margin-bottom:8px" }, "Activity log"),
       h("div", { class: "card pad" }, act.slice(0, 40).map(a => h("div", { class: "small", style: "padding:4px 0;border-bottom:1px solid var(--line)" }, h("span", { class: "muted" }, a.at.replace("T", " ").slice(0, 16), " · "), a.text)))));
+}
+
+const PERM_SHORT = { approve: "Approve", manage_clients: "Clients", send_messages: "Message", all_clients: "All clients", export: "Export", manage_team: "Team" };
+
+function teamRow(u, admin) {
+  const isPartner = u.role === "partner";
+  const save = patch => safely(async () => { await api("PATCH", `/api/users/${u.id}`, patch); toast("Access updated"); await boot(); });
+  return h("tr", { style: u.active ? "" : "opacity:.5" },
+    h("td", {}, h("div", { class: "who" }, h("span", { class: "avatar" }, initials(u.name)), h("div", {}, h("b", {}, u.name), u.email ? h("div", { class: "small muted" }, u.email)
+      : admin ? h("a", { href: "#", class: "small", onclick: async e => { e.preventDefault();
+          const v = await ask(`Sign-in email for ${u.name}`, [{ name: "email", label: "Email", type: "email", required: true }], "Save");
+          if (v) save({ email: v.email }); } }, "Add sign-in email") : h("div", { class: "small muted" }, "no login yet")))),
+    h("td", {}, admin && u.id !== S.me.id ? h("select", { class: "input", style: "width:auto", onchange: e => save({ role: e.target.value }) },
+      ["staff", "partner"].map(r => h("option", { value: r, selected: r === u.role }, r === "partner" ? "Partner" : "Staff"))) : (isPartner ? "Partner" : "Staff")),
+    Object.keys(S.boot.perms).map(k => h("td", { class: "hide-sm", style: "text-align:center" },
+      h("input", { type: "checkbox", checked: u.perms.includes(k), disabled: !admin || isPartner || null, title: S.boot.perms[k],
+        onchange: e => save({ perms: e.target.checked ? [...u.perms, k] : u.perms.filter(x => x !== k) }) }))),
+    h("td", {}, admin && u.id !== S.me.id ? h("div", { class: "row" },
+      h("button", { class: "btn sm ghost", onclick: () => safely(async () => {
+        if (!confirm(`Reset ${u.name}'s password? They'll be signed out everywhere.`)) return;
+        const r = await api("POST", `/api/users/${u.id}/reset`); showTempPassword(u.name, u.email, r.temp_password);
+      }) }, "Reset password"),
+      h("button", { class: "btn sm ghost" + (u.active ? " danger" : ""), onclick: () => save({ active: !u.active }) }, u.active ? "Deactivate" : "Reactivate")) : null));
+}
+
+function showTempPassword(name, email, pw) {
+  drawer(`Sign-in for ${name}`, [
+    h("div", { class: "hint" }, "Share this once, in person or on a call. It won't be shown again; they'll set their own password on first sign-in."),
+    h("div", { class: "card pad" }, h("div", { class: "small muted" }, "Email"), h("b", {}, email), h("div", { class: "small muted", style: "margin-top:8px" }, "Temporary password"),
+      h("div", { style: "font:600 22px ui-monospace,monospace;letter-spacing:.04em" }, pw)),
+    h("button", { class: "btn", onclick: () => navigator.clipboard.writeText(`${location.origin}\nEmail: ${email}\nPassword: ${pw}`).then(() => toast("Copied")) }, "Copy sign-in details")]);
+}
+
+function inviteUser() {
+  const name = h("input", { class: "input", placeholder: "Priya Shah" });
+  const email = h("input", { class: "input", type: "email", placeholder: "priya@yourfirm.in" });
+  const role = h("select", { class: "input" }, h("option", { value: "staff" }, "Staff"), h("option", { value: "partner" }, "Partner"));
+  const DEFAULT = ["manage_clients", "send_messages", "all_clients", "export"];
+  const boxes = Object.entries(S.boot.perms).map(([k, label]) => {
+    const cb = h("input", { type: "checkbox", checked: DEFAULT.includes(k), value: k });
+    return h("label", { class: "toggle" + (DEFAULT.includes(k) ? " on" : "") }, cb, label);
+  });
+  boxes.forEach(b => b.querySelector("input").addEventListener("change", e => b.classList.toggle("on", e.target.checked)));
+  const permWrap = h("div", { style: "display:grid;gap:6px" }, boxes);
+  role.addEventListener("change", () => permWrap.classList.toggle("hidden", role.value === "partner"));
+  drawer("Invite a colleague", [
+    h("div", { class: "grid2" }, h("label", { class: "field" }, "Name", name), h("label", { class: "field" }, "Email (their sign-in)", email)),
+    h("label", { class: "field" }, "Role", role), h("div", { class: "small muted" }, "What can they do?"), permWrap,
+  ], [h("button", { class: "btn", onclick: closeDrawer }, "Cancel"), h("button", { class: "btn primary", onclick: () => safely(async () => {
+    const perms = boxes.map(b => b.querySelector("input")).filter(i => i.checked).map(i => i.value);
+    const r = await api("POST", "/api/users", { name: name.value, email: email.value, role: role.value, perms });
+    await boot(); showTempPassword(r.user.name, r.user.email, r.temp_password);
+  }) }, "Invite")]);
+}
+
+function changePassword(forced) {
+  const cur = h("input", { class: "input", type: "password", autocomplete: "current-password" });
+  const nw = h("input", { class: "input", type: "password", autocomplete: "new-password", placeholder: "At least 8 characters" });
+  const go = () => safely(async () => {
+    await api("POST", "/api/auth/password", { current: cur.value, new: nw.value });
+    closeDrawer(); toast("Password changed"); if (forced) boot();
+  });
+  const dr = drawer(forced ? "Set your own password" : "Change password", [
+    forced ? h("div", { class: "hint" }, "You signed in with a temporary password. Choose your own to continue.") : null,
+    h("label", { class: "field" }, forced ? "Temporary password" : "Current password", cur), h("label", { class: "field" }, "New password", nw),
+  ], [forced ? null : h("button", { class: "btn", onclick: closeDrawer }, "Cancel"), h("button", { class: "btn primary", onclick: go }, "Save")]);
+  dr.addEventListener("keydown", e => e.key === "Enter" && go());
+  if (forced) { document.querySelector(".scrim").onclick = null; dr.querySelector("header button").remove(); }
+}
+
+// ----------------------------------------------------------------- AUTH
+async function showAuth() {
+  clearTimeout(S.poll);
+  const st = await fetch("/api/auth/state", { credentials: "same-origin" }).then(r => r.json()).catch(() => ({}));
+  if (st.user && !st.setup_needed) return boot();
+  closeDrawer();
+  document.querySelector(".shell").classList.add("hidden");
+  let screen = $("#auth");
+  if (!screen) { screen = h("div", { id: "auth", class: "auth" }); document.body.append(screen); }
+  const err = h("div", { class: "small", style: "color:var(--red);min-height:18px" });
+  const field = (label, attrs) => { const i = h("input", Object.assign({ class: "input" }, attrs)); return [h("label", { class: "field" }, label, i), i]; };
+  const submit = async (fn) => { err.textContent = ""; try { await fn(); history.replaceState(null, "", "#/today"); screen.remove(); document.querySelector(".shell").classList.remove("hidden"); await boot(); } catch (e) { err.textContent = e.message; } };
+  const post = async (path, body) => {
+    const r = await fetch(path, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(typeof d.detail === "string" ? d.detail : "Something went wrong");
+    return d;
+  };
+  let form;
+  if (st.setup_needed) {
+    const [fL, firm] = field("Firm name", { placeholder: "Kulkarni & Co., Chartered Accountants" });
+    const [nL, name] = field("Your name", { placeholder: "CA Neha Kulkarni", autocomplete: "name" });
+    const [eL, email] = field("Email (your sign-in)", { type: "email", autocomplete: "email" });
+    const [pL, pw] = field("Password", { type: "password", autocomplete: "new-password", placeholder: "At least 8 characters" });
+    form = [h("h1", {}, "Set up your office"), h("p", { class: "muted" }, "You'll be the first partner. You can invite your team next."),
+      fL, nL, eL, pL, err, h("button", { class: "btn primary", type: "submit" }, "Create office")];
+    form.onsubmit = () => submit(() => post("/api/auth/setup", { firm_name: firm.value, name: name.value, email: email.value, password: pw.value }));
+  } else {
+    const [eL, email] = field("Email", { type: "email", autocomplete: "username" });
+    const [pL, pw] = field("Password", { type: "password", autocomplete: "current-password" });
+    form = [h("h1", {}, "Sign in"), h("p", { class: "muted" }, st.firm_name || ""), eL, pL, err, h("button", { class: "btn primary", type: "submit" }, "Sign in"),
+      h("div", { class: "small muted" }, "Forgot your password? Ask a partner to reset it from Settings → Team.")];
+    form.onsubmit = () => submit(() => post("/api/auth/login", { email: email.value, password: pw.value }));
+  }
+  const onsubmit = form.onsubmit;
+  fill(screen, h("div", { class: "card auth-card" }, h("div", { class: "logo" }, h("div", { class: "logo-mark" }, "₹"), h("div", {}, "CA Brain", h("small", {}, "Company brain"))),
+    h("form", { onsubmit: e => { e.preventDefault(); onsubmit(); } }, form)));
+  setTimeout(() => { const i = screen.querySelector("input"); i && i.focus(); }, 20);
 }
 
 // ------------------------------------------------------------- ASK (brain)
@@ -699,7 +872,7 @@ function setupAsk() {
           }) }, "Confirm")),
           p.kind === "chase" ? h("pre", {}, p.payload.body) : null,
           p.kind === "add_client" ? h("pre", {}, Object.entries(p.payload).filter(([, v]) => v && v !== "none").map(([k, v]) => `${k.replace(/_/g, " ")}: ${v === true ? "yes" : v}`).join("\n")) : null,
-          p.kind === "override_due" ? h("pre", {}, `Reason: ${p.payload.reason}\n${S.me.role === "partner" ? "Applies immediately for every affected client." : "Will go to a partner for approval."}`) : null);
+          p.kind === "override_due" ? h("pre", {}, `Reason: ${p.payload.reason}\n${can("approve") ? "Applies immediately for every affected client." : "Will go to a partner for approval."}`) : null);
         return card;
       }),
       h("div", { class: "small muted", style: "margin-top:8px" }, r.via === "claude" ? "Answered with Claude · changes need your confirmation" : "Esc to close"));
@@ -769,12 +942,12 @@ async function route() {
 }
 
 async function boot() {
-  const meId = store.get("me", null);
-  S.me = meId ? { id: meId } : null;
-  S.boot = await api("GET", "/api/bootstrap");
+  try { S.boot = await api("GET", "/api/bootstrap"); } catch { return; }  // 401 already showed the sign-in screen
   S.me = S.boot.me;
-  store.set("me", S.me.id);
+  $("#auth") && $("#auth").remove();
+  document.querySelector(".shell").classList.remove("hidden");
   await route();
+  if (S.me.must_change_pw) changePassword(true);
 }
 
 window.addEventListener("hashchange", () => { closeDrawer(); route(); });

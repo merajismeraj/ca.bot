@@ -229,7 +229,16 @@ def detect_fy(s: str) -> int | None:
     return None
 
 
+# Dates stamped by WhatsApp / phones / scanners record when a file was sent or scanned, not the period it covers.
+STAMP_RE = re.compile(
+    r"(?:IMG|DOC|VID|AUD|PTT|STK)-\d{8}-WA\d+|\d{6,8}-(?:PHOTO|DOCUMENT|VIDEO|AUDIO)-[\d\-]+"
+    r"|WhatsApp (?:Image|Document|Video) \d{4}-\d{2}-\d{2} at [\d.]+(?: \(\d+\))?"
+    r"|(?:Scan|Scanned|CamScanner|Document|Photo|PXL|IMG)[ _-]?\d{4}[-_.]?\d{2}[-_.]?\d{2}(?:[ _-]?\d{2}[.:_-]?\d{2}(?:[.:_-]?\d{2})?)?",
+    re.I)
+
+
 def match_period(path_str: str, text: str, doc_type: str, today: date | None = None) -> tuple[str | None, str | None, float, str]:
+    path_str = STAMP_RE.sub(" ", path_str)
     name = Path(path_str).name
     # month in filename wins - most statements are named that way
     for src, label in ((name, "file name"), (path_str, "folder name")):

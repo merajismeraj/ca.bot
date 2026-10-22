@@ -9,20 +9,19 @@ The office dumps files once. From then on the engine keeps three things true:
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import os
-import zipfile
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path, PurePosixPath
 
-from . import classifier, db
+from . import auth, classifier, db, ocr
 from . import fy as F
 from .catalog import DOC_TYPES
 from .compliance import RULES_BY_CODE, generate, required_months
 
-ACCEPTED_SUFFIXES = {".pdf", ".csv", ".xlsx", ".xlsm", ".xls", ".txt", ".json", ".xml", ".jpg", ".jpeg", ".png", ".tsv"}
+ACCEPTED_SUFFIXES = {".pdf", ".csv", ".xlsx", ".xlsm", ".xls", ".txt", ".json", ".xml", ".jpg", ".jpeg", ".png", ".tsv",
+                     ".tif", ".tiff", ".webp", ".docx"}
 DONE = ("filed", "na", "not_tracked")
 
 
@@ -198,8 +197,8 @@ def transition(conn, obl_id: int, action: str, user: dict, ack_no: str | None = 
     allowed, to, partner_only = TRANSITIONS[action]
     if o["status"] not in allowed:
         raise WorkflowError(f"Can't {action.replace('_', ' ')} from '{o['status']}'")
-    if partner_only and user["role"] != "partner":
-        raise WorkflowError("Only a partner can do this")
+    if partner_only and not auth.can(user, "approve"):
+        raise WorkflowError("Only someone with approval rights (a partner) can do this")
     e = enrich(conn, [o])[0]
     if action == "submit" and e["blockers"]:
         raise WorkflowError("File these first: " + ", ".join(e["blockers"]))
@@ -229,28 +228,8 @@ def _learned(conn) -> tuple[dict[str, int], dict[str, str]]:
     return lc, lt
 
 
-def expand_upload(filename: str, data: bytes) -> list[tuple[str, bytes]]:
-    """Unpack zips (one level of nesting) so a whole office folder can be dropped at once."""
-    if not filename.lower().endswith(".zip"):
-        return [(filename, data)]
-    out = []
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
-        for info in z.infolist():
-            p = PurePosixPath(info.filename)
-            if info.is_dir() or any(part.startswith(("__MACOSX", ".")) for part in p.parts):
-                continue
-            if info.file_size > 50 * 1024 * 1024:
-                continue
-            inner = z.read(info)
-            rel = f"{Path(filename).name}/{info.filename}"
-            if p.suffix.lower() == ".zip":
-                out.extend((f"{Path(filename).name}/{n}", b) for n, b in expand_upload(p.name, inner))
-            else:
-                out.append((rel, inner))
-    return out
-
-
-def ingest(conn, rel_path: str, data: bytes, user: dict, batch_id: str, hint_client_id: int | None = None) -> dict:
+def ingest(conn, rel_path: str, data: bytes, user: dict | None, batch_id: str, hint_client_id: int | None = None,
+           source: str = "upload") -> dict:
     sha = hashlib.sha256(data).hexdigest()
     dup = db.row(conn, "SELECT * FROM documents WHERE sha256=?", (sha,))
     if dup:
@@ -258,21 +237,47 @@ def ingest(conn, rel_path: str, data: bytes, user: dict, batch_id: str, hint_cli
     suffix = Path(rel_path).suffix.lower()
     if suffix not in ACCEPTED_SUFFIXES:
         return {"filename": rel_path, "skipped": True, "reason": f"Unsupported file type {suffix or '(none)'}"}
+    if not data:
+        return {"filename": rel_path, "skipped": True, "reason": "Empty file"}
     stored = db.UPLOAD_DIR / f"{sha[:2]}/{sha}{suffix}"
     stored.parent.mkdir(parents=True, exist_ok=True)
     stored.write_bytes(data)
     text = classifier.extract_text(stored)
-    clients = [db.client_dict(c) for c in db.rows(conn, "SELECT * FROM clients WHERE archived=0")]
-    lc, lt = _learned(conn)
-    r = classifier.classify(rel_path, text, clients, lc, lt, hint_client_id, today())
+    r = _classify(conn, rel_path, text, hint_client_id)
+    # scanned / photographed and not identifiable from its name: read it in the background
+    ocr_status = "pending" if r.status == "needs_review" and ocr.needs_ocr(stored, text) else ""
+    reasons = (["Reading the scanned page…"] if ocr_status else []) + r.reasons
     cur = conn.execute(
         "INSERT INTO documents(sha256,filename,stored_path,size,text_excerpt,client_id,doc_type,fy,period_start,"
-        "period_end,confidence,confs,status,reasons,batch_id,uploaded_by,uploaded_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "period_end,confidence,confs,status,reasons,batch_id,uploaded_by,uploaded_at,ocr_status,hint_client_id,source) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (sha, rel_path, str(stored), len(data), text[:1500], r.client_id, r.doc_type, r.fy, r.period_start,
          r.period_end, r.confidence, json.dumps({"client": r.client_conf, "type": r.type_conf, "period": r.period_conf}),
-         r.status, json.dumps(r.reasons), batch_id, user["id"], db.now()))
+         r.status, json.dumps(reasons), batch_id, (user or {}).get("id"), db.now(), ocr_status, hint_client_id, source))
     return db.row(conn, "SELECT * FROM documents WHERE id=?", (cur.lastrowid,))
+
+
+def _classify(conn, rel_path: str, text: str, hint_client_id: int | None) -> classifier.Result:
+    clients = [db.client_dict(c) for c in db.rows(conn, "SELECT * FROM clients WHERE archived=0")]
+    lc, lt = _learned(conn)
+    return classifier.classify(rel_path, text, clients, lc, lt, hint_client_id, today())
+
+
+def reclassify(conn, doc_id: int, text: str, note: str) -> dict:
+    """Re-run classification with new text (e.g. after OCR). Never overrides a person's decision."""
+    d = db.row(conn, "SELECT * FROM documents WHERE id=?", (doc_id,))
+    if d["status"] in ("confirmed", "rejected"):
+        return d
+    r = _classify(conn, d["filename"], text, d["hint_client_id"])
+    conn.execute(
+        "UPDATE documents SET text_excerpt=?, client_id=?, doc_type=?, fy=?, period_start=?, period_end=?, confidence=?, "
+        "confs=?, status=?, reasons=? WHERE id=?",
+        (text[:1500], r.client_id, r.doc_type, r.fy, r.period_start, r.period_end, r.confidence,
+         json.dumps({"client": r.client_conf, "type": r.type_conf, "period": r.period_conf}), r.status,
+         json.dumps([note] + r.reasons), doc_id))
+    if d["batch_id"]:
+        folder_consensus(conn, d["batch_id"])
+    return db.row(conn, "SELECT * FROM documents WHERE id=?", (doc_id,))
 
 
 def folder_consensus(conn, batch_id: str) -> int:

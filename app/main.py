@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from collections import defaultdict
@@ -10,29 +12,30 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
-from . import brain, db, engine
+from . import archive, auth, brain, db, engine, ocr, whatsapp
 from . import fy as F
 from .catalog import DOC_TYPES, ENTITY_TYPES, GST_STATES, PAN_ENTITY
 from .classifier import GSTIN_RE, PAN_RE
 from .compliance import RULES, RULES_BY_CODE
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
-MAX_UPLOAD = 200 * 1024 * 1024
+MAX_UPLOAD = int(os.environ.get("CABOT_MAX_UPLOAD_MB", 4096)) * 1024 * 1024
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init()
     with db.tx() as c:
-        if not db.rows(c, "SELECT id FROM users"):
-            c.execute("INSERT INTO users(name, role) VALUES ('Partner', 'partner'), ('Staff', 'staff')")
+        if db.get_setting(c, "tracking_start") is None:
             db.set_setting(c, "tracking_start", engine.today().isoformat())
         # roll the calendar forward (new FY on 1 April, profile changes, approved extensions)
         engine.sync_obligations(c)
+    ocr.start_worker()
     yield
 
 
@@ -44,25 +47,128 @@ def _wf(_: Request, e: engine.WorkflowError):
     return JSONResponse({"detail": str(e)}, status_code=400)
 
 
-def current_user(conn, uid: int | None) -> dict:
-    u = db.row(conn, "SELECT * FROM users WHERE id=?", (uid,)) if uid else None
-    return u or db.row(conn, "SELECT * FROM users ORDER BY role='partner' DESC, id LIMIT 1")
+def scope_sql(conn, user: dict, col: str = "client_id") -> tuple[str, list]:
+    """SQL fragment limiting rows to the clients this person may see."""
+    ids = auth.visible_client_ids(conn, user)
+    if ids is None:
+        return "", []
+    if not ids:
+        return " AND 0", []
+    return f" AND {col} IN ({','.join('?' * len(ids))})", sorted(ids)
 
 
-def require_partner(user: dict) -> None:
-    if user["role"] != "partner":
-        raise HTTPException(403, "Only a partner can do this")
+# ================================================================ auth
+class SetupIn(BaseModel):
+    firm_name: str
+    name: str
+    email: str
+    password: str
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
+def _login_response(c, user_id: int, response: Response) -> dict:
+    token = auth.new_session(c, user_id)
+    response.set_cookie(auth.COOKIE, token, httponly=True, samesite="lax", secure=auth.secure_cookies(),
+                        max_age=auth.SESSION_DAYS * 86400, path="/")
+    return {"ok": True, "token": token, "user": auth.public(db.row(c, "SELECT * FROM users WHERE id=?", (user_id,)))}
+
+
+def _norm_email(e: str) -> str:
+    e = (e or "").strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e):
+        raise HTTPException(400, "Enter a valid email address")
+    return e
+
+
+@app.get("/api/auth/state")
+def auth_state(request: Request):
+    with db.tx() as c:
+        u = auth.user_for_token(c, auth.token_from(request))
+        return {"setup_needed": auth.setup_needed(c), "user": auth.public(u) if u else None,
+                "firm_name": db.get_setting(c, "firm_name", "Your CA Office")}
+
+
+@app.post("/api/auth/setup")
+def auth_setup(body: SetupIn, response: Response):
+    """First run only: create the office and its first partner."""
+    with db.tx() as c:
+        if not auth.setup_needed(c):
+            raise HTTPException(400, "This office is already set up — sign in instead")
+        auth.validate_pw(body.password)
+        if not body.name.strip():
+            raise HTTPException(400, "Your name is required")
+        email = _norm_email(body.email)
+        db.set_setting(c, "firm_name", body.firm_name.strip() or "Your CA Office")
+        # an older install has users without passwords: the first partner becomes this login
+        legacy = db.row(c, "SELECT id FROM users WHERE role='partner' AND pw_hash IS NULL ORDER BY id LIMIT 1")
+        if legacy:
+            c.execute("UPDATE users SET name=?, email=?, pw_hash=?, active=1 WHERE id=?",
+                      (body.name.strip(), email, auth.hash_pw(body.password), legacy["id"]))
+            uid = legacy["id"]
+        else:
+            uid = c.execute("INSERT INTO users(name, role, email, pw_hash, perms, active) VALUES(?,?,?,?,?,1)",
+                            (body.name.strip(), "partner", email, auth.hash_pw(body.password), "[]")).lastrowid
+        db.log(c, uid, "setup", "office", None, f"{body.name.strip()} set up the office")
+        return _login_response(c, uid, response)
+
+
+@app.post("/api/auth/login")
+def login(body: LoginIn, response: Response, request: Request):
+    key = (body.email or "").strip().lower()
+    auth.check_rate(key)
+    auth.check_rate(f"ip:{request.client.host if request.client else '-'}")
+    with db.tx() as c:
+        u = db.row(c, "SELECT * FROM users WHERE email=? AND active=1", (key,))
+        if not u or not auth.check_pw(body.password, u["pw_hash"]):
+            auth.record_fail(key)
+            auth.record_fail(f"ip:{request.client.host if request.client else '-'}")
+            raise HTTPException(401, "Email or password is wrong")
+        db.log(c, u["id"], "login", "user", u["id"], f"{u['name']} signed in")
+        return _login_response(c, u["id"], response)
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response):
+    with db.tx() as c:
+        auth.end_session(c, auth.token_from(request))
+    response.delete_cookie(auth.COOKIE, path="/")
+    return {"ok": True}
+
+
+class PasswordIn(BaseModel):
+    current: str
+    new: str
+
+
+@app.post("/api/auth/password")
+def change_password(body: PasswordIn, request: Request, user: dict = Depends(auth.current)):
+    if not auth.check_pw(body.current, user["pw_hash"]):
+        raise HTTPException(400, "Current password is wrong")
+    auth.validate_pw(body.new)
+    with db.tx() as c:
+        c.execute("UPDATE users SET pw_hash=?, must_change_pw=0 WHERE id=?", (auth.hash_pw(body.new), user["id"]))
+        # sign out every other device
+        keep = auth._digest(auth.token_from(request) or "")
+        c.execute("DELETE FROM sessions WHERE user_id=? AND token!=?", (user["id"], keep))
+    return {"ok": True}
 
 
 # ================================================================ meta
 @app.get("/api/bootstrap")
-def bootstrap(x_user: int | None = Header(None)):
+def bootstrap(user: dict = Depends(auth.current)):
     with db.tx() as c:
         cur = F.fy_of(engine.today())
         signed = {r["fy"]: r for r in db.rows(c, "SELECT * FROM calendar_signoff")}
         return {
-            "me": current_user(c, x_user),
-            "users": db.rows(c, "SELECT * FROM users ORDER BY id"),
+            "me": auth.public(user),
+            "users": [auth.public(u) for u in db.rows(c, "SELECT * FROM users WHERE active=1 ORDER BY id")],
+            "perms": auth.PERMS,
+            "whatsapp": whatsapp.configured(),
+            "ocr": {"tesseract": ocr.tesseract_available(), "vision": ocr.vision_enabled()},
             "firm_name": db.get_setting(c, "firm_name", "Your CA Office"),
             "today": engine.today().isoformat(),
             "tracking_start": db.get_setting(c, "tracking_start", engine.today().isoformat()),
@@ -73,6 +179,7 @@ def bootstrap(x_user: int | None = Header(None)):
             "rules": [{"code": r.code, "name": r.name, "form": r.form, "authority": r.authority} for r in RULES],
             "llm": brain.llm_available(),
             "has_clients": bool(db.rows(c, "SELECT id FROM clients LIMIT 1")),
+            "can_load_demo": not db.rows(c, "SELECT id FROM clients LIMIT 1") and auth.can(user, "manage_team"),
         }
 
 
@@ -82,9 +189,9 @@ class Settings(BaseModel):
 
 
 @app.post("/api/settings")
-def save_settings(s: Settings, x_user: int | None = Header(None)):
+def save_settings(s: Settings, user: dict = Depends(auth.current)):
+    auth.require(user, "manage_team")
     with db.tx() as c:
-        require_partner(current_user(c, x_user))
         if s.firm_name is not None:
             db.set_setting(c, "firm_name", s.firm_name.strip() or "Your CA Office")
         if s.tracking_start:
@@ -98,30 +205,98 @@ def save_settings(s: Settings, x_user: int | None = Header(None)):
 
 class NewUser(BaseModel):
     name: str
-    role: str
+    email: str
+    role: str = "staff"
+    perms: list[str] | None = None
+    phone: str | None = None
+
+
+class UserPatch(BaseModel):
+    name: str | None = None
+    email: str | None = None
+    role: str | None = None
+    perms: list[str] | None = None
+    active: bool | None = None
+    phone: str | None = None
+
+
+@app.get("/api/users")
+def list_users(user: dict = Depends(auth.current)):
+    with db.tx() as c:
+        return [auth.public(u) for u in db.rows(c, "SELECT * FROM users ORDER BY active DESC, role='partner' DESC, name")]
 
 
 @app.post("/api/users")
-def add_user(u: NewUser, x_user: int | None = Header(None)):
+def add_user(u: NewUser, user: dict = Depends(auth.current)):
+    """Invite a colleague. Returns a one-time password to hand over; they must change it on first sign-in."""
+    auth.require(user, "manage_team")
+    if u.role not in ("staff", "partner") or not u.name.strip():
+        raise HTTPException(400, "Name and a role of staff/partner are required")
+    email = _norm_email(u.email)
+    perms = [p for p in (u.perms if u.perms is not None else auth.STAFF_DEFAULT) if p in auth.PERMS]
+    temp = auth.temp_password()
     with db.tx() as c:
-        require_partner(current_user(c, x_user))
-        if u.role not in ("staff", "partner") or not u.name.strip():
-            raise HTTPException(400, "Name and a role of staff/partner are required")
-        cur = c.execute("INSERT INTO users(name, role) VALUES(?,?)", (u.name.strip(), u.role))
-        return db.row(c, "SELECT * FROM users WHERE id=?", (cur.lastrowid,))
+        if db.row(c, "SELECT id FROM users WHERE email=?", (email,)):
+            raise HTTPException(400, "Someone with this email is already on the team")
+        uid = c.execute("INSERT INTO users(name, role, email, pw_hash, perms, active, must_change_pw, phone) "
+                        "VALUES(?,?,?,?,?,1,1,?)", (u.name.strip(), u.role, email, auth.hash_pw(temp), json.dumps(perms),
+                                                    re.sub(r"\D", "", u.phone or "")[-10:] or None)).lastrowid
+        db.log(c, user["id"], "user_add", "user", uid, f"{user['name']} invited {u.name.strip()} ({u.role})")
+        return {"user": auth.public(db.row(c, "SELECT * FROM users WHERE id=?", (uid,))), "temp_password": temp}
+
+
+@app.patch("/api/users/{uid}")
+def edit_user(uid: int, p: UserPatch, user: dict = Depends(auth.current)):
+    auth.require(user, "manage_team")
+    with db.tx() as c:
+        target = db.row(c, "SELECT * FROM users WHERE id=?", (uid,))
+        if not target:
+            raise HTTPException(404)
+        new_role = p.role or target["role"]
+        new_active = target["active"] if p.active is None else int(p.active)
+        if new_role not in ("staff", "partner"):
+            raise HTTPException(400, "Role must be staff or partner")
+        if target["role"] == "partner" and (new_role != "partner" or not new_active):
+            others = db.row(c, "SELECT COUNT(*) n FROM users WHERE role='partner' AND active=1 AND id!=?", (uid,))["n"]
+            if not others:
+                raise HTTPException(400, "The office needs at least one active partner")
+        perms = json.dumps([x for x in p.perms if x in auth.PERMS]) if p.perms is not None else target["perms"]
+        email = _norm_email(p.email) if p.email is not None else None
+        if email and db.row(c, "SELECT id FROM users WHERE email=? AND id!=?", (email, uid)):
+            raise HTTPException(400, "Someone else already uses this email")
+        c.execute("UPDATE users SET name=COALESCE(?,name), email=COALESCE(?,email), role=?, perms=?, active=?, "
+                  "phone=COALESCE(?,phone) WHERE id=?", (p.name, email, new_role, perms, new_active, p.phone, uid))
+        if not new_active:
+            c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+        db.log(c, user["id"], "user_edit", "user", uid, f"{user['name']} updated {target['name']}'s access")
+        return auth.public(db.row(c, "SELECT * FROM users WHERE id=?", (uid,)))
+
+
+@app.post("/api/users/{uid}/reset")
+def reset_password(uid: int, user: dict = Depends(auth.current)):
+    auth.require(user, "manage_team")
+    temp = auth.temp_password()
+    with db.tx() as c:
+        t = db.row(c, "SELECT * FROM users WHERE id=?", (uid,))
+        if not t:
+            raise HTTPException(404)
+        c.execute("UPDATE users SET pw_hash=?, must_change_pw=1 WHERE id=?", (auth.hash_pw(temp), uid))
+        c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+        db.log(c, user["id"], "user_reset", "user", uid, f"{user['name']} reset {t['name']}'s password")
+    return {"temp_password": temp}
 
 
 # =========================================================== dashboard
 @app.get("/api/dashboard")
-def dashboard(x_user: int | None = Header(None), mine: bool = False):
+def dashboard(user: dict = Depends(auth.current), mine: bool = False):
     t = engine.today()
     with db.tx() as c:
-        me = current_user(c, x_user)
+        sc, sa = scope_sql(c, user)
         obls = engine.enrich(c, db.rows(
-            c, "SELECT * FROM obligations WHERE status NOT IN ('filed','na','not_tracked') AND due<=? ORDER BY due",
-            ((t + timedelta(days=30)).isoformat(),)))
+            c, "SELECT * FROM obligations WHERE status NOT IN ('filed','na','not_tracked') AND due<=?" + sc + " ORDER BY due",
+            ((t + timedelta(days=30)).isoformat(), *sa)))
         if mine:
-            obls = [o for o in obls if o["assignee_id"] in (None, me["id"])]
+            obls = [o for o in obls if o["assignee_id"] in (None, user["id"])]
         counts = defaultdict(int)
         for o in obls:
             if o["days_left"] < 0:
@@ -129,30 +304,38 @@ def dashboard(x_user: int | None = Header(None), mine: bool = False):
             elif o["days_left"] <= 7:
                 counts["week"] += 1
             counts[o["stage"]] += 1
-        # what this person should do, most urgent first; partner sees approvals at the top
+        approver = auth.can(user, "approve")
+
+        # what this person should do, most urgent first; approvers see approvals at the top
         def rank(o):
-            mine_first = 0 if (o["next_action"] and o["next_action"]["role"] == me["role"]) else 1
-            return (mine_first if me["role"] == "partner" else 0, o["days_left"])
+            needs_me = o["next_action"] and o["next_action"]["role"] == "partner"
+            return (0 if (approver and needs_me) else 1, o["days_left"])
         obls.sort(key=rank)
+        dsc, dsa = scope_sql(c, user)
         return {
             "counts": {
                 "overdue": counts["overdue"], "week": counts["week"],
                 "awaiting_docs": counts["awaiting_docs"], "review": counts["review"],
                 "ready": counts["ready"], "in_progress": counts["in_progress"], "approved": counts["approved"],
-                "inbox": db.row(c, "SELECT COUNT(*) n FROM documents WHERE status='needs_review'")["n"],
-                "outbox": db.row(c, "SELECT COUNT(*) n FROM messages WHERE status IN ('draft','approved')")["n"],
+                "inbox": db.row(c, "SELECT COUNT(*) n FROM documents WHERE status='needs_review' AND "
+                                   "(client_id IS NULL" + (dsc.replace(" AND", " OR", 1) if dsc else " OR 1") + ")", dsa)["n"],
+                "reading": db.row(c, "SELECT COUNT(*) n FROM documents WHERE ocr_status IN ('pending','running')")["n"],
+                "outbox": db.row(c, "SELECT COUNT(*) n FROM messages WHERE direction='out' AND status IN ('draft','approved')"
+                                    + sc, sa)["n"],
+                "replies": db.row(c, "SELECT COUNT(*) n FROM messages WHERE direction='in' AND status='received'" + sc, sa)["n"],
                 "overrides": db.row(c, "SELECT COUNT(*) n FROM due_overrides WHERE status='proposed'")["n"],
-                "clients": db.row(c, "SELECT COUNT(*) n FROM clients WHERE archived=0")["n"],
+                "clients": db.row(c, "SELECT COUNT(*) n FROM clients WHERE archived=0" + scope_sql(c, user, "id")[0],
+                                  scope_sql(c, user, "id")[1])["n"],
             },
             "items": obls[:150],
-            "filed_this_month": db.row(c, "SELECT COUNT(*) n FROM obligations WHERE status='filed' AND filed_on>=?",
-                                       (t.replace(day=1).isoformat(),))["n"],
+            "filed_this_month": db.row(c, "SELECT COUNT(*) n FROM obligations WHERE status='filed' AND filed_on>=?" + sc,
+                                       (t.replace(day=1).isoformat(), *sa))["n"],
         }
 
 
 @app.get("/api/obligations")
 def obligations(client_id: int | None = None, fy: int | None = None, start: str | None = None,
-                end: str | None = None, include_done: bool = True):
+                end: str | None = None, include_done: bool = True, user: dict = Depends(auth.current)):
     sql, args = "SELECT * FROM obligations WHERE status!='not_tracked'", []
     for col, op, val in (("client_id", "=", client_id), ("fy", "=", fy), ("due", ">=", start), ("due", "<=", end)):
         if val is not None:
@@ -161,7 +344,16 @@ def obligations(client_id: int | None = None, fy: int | None = None, start: str 
     if not include_done:
         sql += " AND status NOT IN ('filed','na')"
     with db.tx() as c:
-        return engine.enrich(c, db.rows(c, sql + " ORDER BY due, client_id", args))
+        sc, sa = scope_sql(c, user)
+        return engine.enrich(c, db.rows(c, sql + sc + " ORDER BY due, client_id", [*args, *sa]))
+
+
+def _obligation_for(c, oid: int, user: dict) -> dict:
+    o = db.row(c, "SELECT * FROM obligations WHERE id=?", (oid,))
+    if not o:
+        raise HTTPException(404, "Filing not found")
+    auth.require_client(c, user, o["client_id"])
+    return o
 
 
 class Action(BaseModel):
@@ -172,9 +364,10 @@ class Action(BaseModel):
 
 
 @app.post("/api/obligations/{oid}/action")
-def obligation_action(oid: int, a: Action, x_user: int | None = Header(None)):
+def obligation_action(oid: int, a: Action, user: dict = Depends(auth.current)):
     with db.tx() as c:
-        return engine.transition(c, oid, a.action, current_user(c, x_user), a.ack_no, a.filed_on, a.note)
+        _obligation_for(c, oid, user)
+        return engine.transition(c, oid, a.action, user, a.ack_no, a.filed_on, a.note)
 
 
 class Assign(BaseModel):
@@ -182,22 +375,27 @@ class Assign(BaseModel):
 
 
 @app.post("/api/obligations/{oid}/assign")
-def obligation_assign(oid: int, a: Assign, x_user: int | None = Header(None)):
+def obligation_assign(oid: int, a: Assign, user: dict = Depends(auth.current)):
     with db.tx() as c:
+        o = _obligation_for(c, oid, user)
+        if a.assignee_id and not db.row(c, "SELECT id FROM users WHERE id=? AND active=1", (a.assignee_id,)):
+            raise HTTPException(400, "Unknown team member")
         c.execute("UPDATE obligations SET assignee_id=? WHERE id=?", (a.assignee_id, oid))
+        db.log(c, user["id"], "assign", "obligation", oid, f"{user['name']} reassigned {o['rule_code']} {o['period_key']}")
         return engine.enrich(c, [db.row(c, "SELECT * FROM obligations WHERE id=?", (oid,))])[0]
 
 
 # ============================================================= calendar
 @app.get("/api/calendar")
-def calendar_view(month: str):
+def calendar_view(month: str, user: dict = Depends(auth.current)):
     """month = YYYY-MM. Returns per-day lists of obligations, grouped by form."""
     y, m = F.parse_month_key(month)
     start = date(y, m, 1)
     end = (date(y + (m == 12), m % 12 + 1, 1) - timedelta(days=1))
     with db.tx() as c:
-        obls = engine.enrich(c, db.rows(c, "SELECT * FROM obligations WHERE status!='not_tracked' AND due BETWEEN ? AND ? "
-                                           "ORDER BY due", (start.isoformat(), end.isoformat())))
+        sc, sa = scope_sql(c, user)
+        obls = engine.enrich(c, db.rows(c, "SELECT * FROM obligations WHERE status!='not_tracked' AND due BETWEEN ? AND ?"
+                                           + sc + " ORDER BY due", (start.isoformat(), end.isoformat(), *sa)))
     days: dict[str, dict] = {}
     for o in obls:
         d = days.setdefault(o["due"], {"date": o["due"], "groups": {}})
@@ -220,7 +418,10 @@ class OverrideIn(BaseModel):
 def _propose_override(c, o: OverrideIn, user: dict) -> dict:
     if o.rule_code not in RULES_BY_CODE:
         raise HTTPException(400, "Unknown compliance")
-    date.fromisoformat(o.new_due)
+    try:
+        date.fromisoformat(o.new_due)
+    except ValueError:
+        raise HTTPException(400, "New due date must be a date")
     if not o.reason.strip():
         raise HTTPException(400, "Cite the notification / circular as the reason")
     cur = c.execute("INSERT INTO due_overrides(rule_code,fy,period_key,new_due,reason,status,proposed_by,created_at) "
@@ -232,13 +433,13 @@ def _propose_override(c, o: OverrideIn, user: dict) -> dict:
 
 
 @app.post("/api/overrides")
-def propose_override(o: OverrideIn, x_user: int | None = Header(None)):
+def propose_override(o: OverrideIn, user: dict = Depends(auth.current)):
     with db.tx() as c:
-        return _propose_override(c, o, current_user(c, x_user))
+        return _propose_override(c, o, user)
 
 
 @app.get("/api/overrides")
-def list_overrides():
+def list_overrides(user: dict = Depends(auth.current)):
     with db.tx() as c:
         out = db.rows(c, "SELECT o.*, u.name proposer FROM due_overrides o LEFT JOIN users u ON u.id=o.proposed_by "
                          "ORDER BY o.status='proposed' DESC, o.id DESC")
@@ -252,12 +453,11 @@ def list_overrides():
 
 
 @app.post("/api/overrides/{oid}/{decision}")
-def decide_override(oid: int, decision: str, x_user: int | None = Header(None)):
+def decide_override(oid: int, decision: str, user: dict = Depends(auth.current)):
     if decision not in ("approve", "reject"):
         raise HTTPException(404)
+    auth.require(user, "approve")
     with db.tx() as c:
-        user = current_user(c, x_user)
-        require_partner(user)
         o = db.row(c, "SELECT * FROM due_overrides WHERE id=?", (oid,))
         if not o or o["status"] != "proposed":
             raise HTTPException(400, "Already decided")
@@ -270,17 +470,16 @@ def decide_override(oid: int, decision: str, x_user: int | None = Header(None)):
 
 
 @app.post("/api/calendar/{fy}/signoff")
-def signoff(fy: int, x_user: int | None = Header(None)):
+def signoff(fy: int, user: dict = Depends(auth.current)):
+    auth.require(user, "approve")
     with db.tx() as c:
-        user = current_user(c, x_user)
-        require_partner(user)
         c.execute("INSERT OR REPLACE INTO calendar_signoff(fy, signed_by, signed_at) VALUES(?,?,?)", (fy, user["id"], db.now()))
         db.log(c, user["id"], "signoff", "calendar", fy, f"{user['name']} signed off the {F.fy_label(fy)} calendar")
         return {"ok": True}
 
 
 @app.get("/api/rules")
-def rules():
+def rules(user: dict = Depends(auth.current)):
     return [{"code": r.code, "name": r.name, "form": r.form, "authority": r.authority, "help": r.help,
              "penalty": r.penalty, "depends_on": list(r.depends_on)} for r in RULES]
 
@@ -341,9 +540,12 @@ def _clean_client(ci: ClientIn) -> dict:
 
 
 def _create_client(c, ci: ClientIn, user: dict) -> dict:
+    auth.require(user, "manage_clients")
     d = _clean_client(ci)
     if d["pan"] and db.row(c, "SELECT id FROM clients WHERE pan=?", (d["pan"],)):
         raise HTTPException(400, f"A client with PAN {d['pan']} already exists")
+    if not auth.can(user, "all_clients") and not d["assignee_id"]:
+        d["assignee_id"] = user["id"]  # otherwise the person who added it couldn't see it
     cols = list(d.keys()) + ["created_at"]
     cur = c.execute(f"INSERT INTO clients({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
                     [d[k] for k in d] + [db.now()])
@@ -375,14 +577,18 @@ def _rematch_unassigned(c) -> None:
 
 
 @app.get("/api/clients")
-def list_clients():
+def list_clients(user: dict = Depends(auth.current)):
     t = engine.today()
     with db.tx() as c:
-        clients = [db.client_dict(x) for x in db.rows(c, "SELECT * FROM clients WHERE archived=0 ORDER BY name")]
+        ic, ia = scope_sql(c, user, "id")
+        sc, sa = scope_sql(c, user)
+        clients = [db.client_dict(x) for x in db.rows(c, "SELECT * FROM clients WHERE archived=0" + ic + " ORDER BY name", ia)]
         obls = engine.enrich(c, db.rows(c, "SELECT * FROM obligations WHERE status NOT IN ('filed','na','not_tracked') "
-                                           "AND due<=?", ((t + timedelta(days=45)).isoformat(),)))
+                                           "AND due<=?" + sc, ((t + timedelta(days=45)).isoformat(), *sa)))
         docs = {r["client_id"]: r["n"] for r in db.rows(c, "SELECT client_id, COUNT(*) n FROM documents "
                                                            "WHERE status IN ('auto','confirmed') GROUP BY client_id")}
+        replies = {r["client_id"]: r["n"] for r in db.rows(c, "SELECT client_id, COUNT(*) n FROM messages "
+                                                              "WHERE direction='in' AND status='received' GROUP BY client_id")}
     by = defaultdict(list)
     for o in obls:
         by[o["client_id"]].append(o)
@@ -393,20 +599,22 @@ def list_clients():
         cl["open"] = len(mine)
         cl["next_due"] = min((o["due"] for o in mine), default=None)
         cl["docs"] = docs.get(cl["id"], 0)
+        cl["replies"] = replies.get(cl["id"], 0)
         cl["health"] = "red" if cl["overdue"] else ("amber" if cl["awaiting_docs"] else "green")
     return clients
 
 
 @app.post("/api/clients")
-def add_client(ci: ClientIn, x_user: int | None = Header(None)):
+def add_client(ci: ClientIn, user: dict = Depends(auth.current)):
     with db.tx() as c:
-        return _create_client(c, ci, current_user(c, x_user))
+        return _create_client(c, ci, user)
 
 
 @app.put("/api/clients/{cid}")
-def update_client(cid: int, ci: ClientIn, x_user: int | None = Header(None)):
+def update_client(cid: int, ci: ClientIn, user: dict = Depends(auth.current)):
+    auth.require(user, "manage_clients")
     with db.tx() as c:
-        user = current_user(c, x_user)
+        auth.require_client(c, user, cid)
         d = _clean_client(ci)
         if d["pan"] and db.row(c, "SELECT id FROM clients WHERE pan=? AND id!=?", (d["pan"], cid)):
             raise HTTPException(400, f"Another client already has PAN {d['pan']}")
@@ -421,7 +629,7 @@ class BulkText(BaseModel):
 
 
 @app.post("/api/clients/preview")
-def preview_clients(b: BulkText):
+def preview_clients(b: BulkText, user: dict = Depends(auth.current)):
     """Plain-language client list -> parsed profiles, one per line, for a human to check before adding."""
     out = []
     with db.tx() as c:
@@ -444,8 +652,9 @@ def preview_clients(b: BulkText):
 
 
 @app.get("/api/clients/{cid}")
-def client_detail(cid: int):
+def client_detail(cid: int, user: dict = Depends(auth.current)):
     with db.tx() as c:
+        auth.require_client(c, user, cid)
         cl = db.row(c, "SELECT * FROM clients WHERE id=?", (cid,))
         if not cl:
             raise HTTPException(404)
@@ -457,6 +666,8 @@ def client_detail(cid: int):
         activity = db.rows(c, "SELECT * FROM activity WHERE (entity='client' AND entity_id=?) OR (entity='obligation' "
                               "AND entity_id IN (SELECT id FROM obligations WHERE client_id=?)) ORDER BY id DESC LIMIT 40",
                            (cid, cid))
+        convo = db.rows(c, "SELECT id, direction, body, status, created_at, sent_at FROM messages WHERE client_id=? "
+                           "AND status!='discarded' ORDER BY id DESC LIMIT 30", (cid,))
     # vault: FY -> doc type -> month grid
     vault = []
     for f in engine.live_fys():
@@ -469,15 +680,15 @@ def client_detail(cid: int):
                 rows_.append({"doc_type": dt, "label": meta["label"], "months": {m: m in have for m in months},
                               "docs": ds})
         vault.append({"fy": f, "label": F.fy_label(f), "months": [F.month_label(m)[:3] for m in months], "rows": rows_})
-    return {"client": db.client_dict(cl), "obligations": obls, "vault": vault,
+    return {"client": db.client_dict(cl), "obligations": obls, "vault": vault, "conversation": convo,
             "unsorted": [d for d in docs if d["status"] == "needs_review"], "activity": activity}
 
 
 @app.delete("/api/clients/{cid}")
-def archive_client(cid: int, x_user: int | None = Header(None)):
+def archive_client(cid: int, user: dict = Depends(auth.current)):
+    auth.require(user, "manage_clients")
+    auth.require(user, "approve")
     with db.tx() as c:
-        user = current_user(c, x_user)
-        require_partner(user)
         c.execute("UPDATE clients SET archived=1 WHERE id=?", (cid,))
         c.execute("DELETE FROM obligations WHERE client_id=? AND status IN ('open','not_tracked')", (cid,))
         db.log(c, user["id"], "client_archive", "client", cid, f"{user['name']} archived client #{cid}")
@@ -487,30 +698,48 @@ def archive_client(cid: int, x_user: int | None = Header(None)):
 # ============================================================ documents
 @app.post("/api/upload")
 async def upload(files: list[UploadFile] = File(...), client_id: int | None = Form(None),
-                 x_user: int | None = Header(None)):
+                 user: dict = Depends(auth.current)):
+    """Accepts any mix of files and zips (nested, Windows-made, WhatsApp exports). Zips are read entry by entry
+    from the spooled upload, never fully into memory."""
     batch = uuid.uuid4().hex[:10]
-    results = []
+    results: list[dict] = []
     total = 0
     with db.tx() as c:
-        user = current_user(c, x_user)
+        if client_id:
+            auth.require_client(c, user, client_id)
         for f in files:
+            name = (f.filename or "upload").replace("\\", "/")
+            head = await f.read(4)
+            await f.seek(0)
+            if archive.is_zip(name, head):
+                f.file.seek(0, 2)
+                total += f.file.tell()
+                f.file.seek(0)
+                if total > MAX_UPLOAD:
+                    raise HTTPException(413, "Upload too large — split it into smaller zips")
+                for e in archive.expand(name, f.file):
+                    if e.skipped:
+                        results.append({"filename": e.path, "skipped": True, "reason": e.skipped})
+                    else:
+                        results.append(engine.ingest(c, e.path, e.data, user, batch, client_id))
+                continue
             data = await f.read()
             total += len(data)
             if total > MAX_UPLOAD:
-                raise HTTPException(413, "Upload too large — split it into batches under 200 MB")
-            try:
-                parts = engine.expand_upload(f.filename or "upload", data)
-            except Exception:
-                results.append({"filename": f.filename, "skipped": True, "reason": "Could not open this zip"})
+                raise HTTPException(413, "Upload too large — split it into smaller batches")
+            if len(data) > archive.MAX_FILE:
+                results.append({"filename": name, "skipped": True, "reason": "Larger than 100 MB"})
                 continue
-            for rel, blob in parts:
-                results.append(engine.ingest(c, rel, blob, user, batch, client_id))
+            results.append(engine.ingest(c, name, data, user, batch, client_id))
         engine.folder_consensus(c, batch)
         # re-read: consensus may have promoted files out of the review queue
         results = [db.row(c, "SELECT * FROM documents WHERE id=?", (r["id"],)) | {"duplicate": r.get("duplicate")}
                    if r.get("id") else r for r in results]
-        filed = [r for r in results if r.get("status") == "auto" and not r.get("duplicate")]
-        review = [r for r in results if r.get("status") == "needs_review" and not r.get("duplicate")]
+        fresh = [r for r in results if r.get("id") and not r.get("duplicate")]
+        filed = [r for r in fresh if r["status"] == "auto"]
+        review = [r for r in fresh if r["status"] == "needs_review"]
+        reading = [r for r in fresh if r.get("ocr_status") == "pending"]
+        skipped = [r for r in results if r.get("skipped")]
         db.log(c, user["id"], "upload", "batch", None,
                f"{user['name']} uploaded {len(results)} files · {len(filed)} auto-filed · {len(review)} need a look")
         return {
@@ -518,21 +747,35 @@ async def upload(files: list[UploadFile] = File(...), client_id: int | None = Fo
             "total": len(results),
             "auto": len(filed),
             "review": len(review),
+            "reading": len(reading),
             "duplicates": sum(1 for r in results if r.get("duplicate")),
-            "skipped": [r for r in results if r.get("skipped")],
-            "files": [engine.doc_summary(r) for r in results if not r.get("skipped")],
+            "skipped": [{"filename": r["filename"], "reason": r["reason"]} for r in skipped],
+            "files": [engine.doc_summary(r) for r in results if r.get("id")][:500],
         }
 
 
 @app.get("/api/documents")
-def documents(status: str | None = None, client_id: int | None = None, batch: str | None = None):
+def documents(status: str | None = None, client_id: int | None = None, batch: str | None = None,
+              user: dict = Depends(auth.current)):
     sql, args = "SELECT d.*, c.name client_name FROM documents d LEFT JOIN clients c ON c.id=d.client_id WHERE 1=1", []
     for col, val in (("d.status", status), ("d.client_id", client_id), ("d.batch_id", batch)):
         if val is not None:
             sql += f" AND {col}=?"
             args.append(val)
     with db.tx() as c:
+        sc, sa = scope_sql(c, user, "d.client_id")
+        if sc:  # restricted staff also see unassigned files, so the Inbox can still be worked
+            sql += " AND (d.client_id IS NULL" + sc.replace(" AND", " OR", 1) + ")"
+            args += sa
         return [engine.doc_summary(d) for d in db.rows(c, sql + " ORDER BY d.id DESC LIMIT 500", args)]
+
+
+def _doc_for(c, did: int, user: dict) -> dict:
+    d = db.row(c, "SELECT * FROM documents WHERE id=?", (did,))
+    if not d:
+        raise HTTPException(404, "Document not found")
+    auth.require_client(c, user, d["client_id"])
+    return d
 
 
 class Confirm(BaseModel):
@@ -543,35 +786,70 @@ class Confirm(BaseModel):
 
 
 @app.post("/api/documents/{did}/confirm")
-def confirm(did: int, body: Confirm, x_user: int | None = Header(None)):
+def confirm(did: int, body: Confirm, user: dict = Depends(auth.current)):
     with db.tx() as c:
-        return engine.doc_summary(engine.confirm_document(c, did, current_user(c, x_user), body.client_id,
+        _doc_for(c, did, user)
+        auth.require_client(c, user, body.client_id)
+        return engine.doc_summary(engine.confirm_document(c, did, user, body.client_id,
                                                           body.doc_type, body.period_start, body.period_end))
 
 
 @app.post("/api/documents/{did}/reject")
-def reject(did: int, x_user: int | None = Header(None)):
+def reject(did: int, user: dict = Depends(auth.current)):
     with db.tx() as c:
-        user = current_user(c, x_user)
+        _doc_for(c, did, user)
         c.execute("UPDATE documents SET status='rejected' WHERE id=?", (did,))
         db.log(c, user["id"], "doc_reject", "document", did, f"{user['name']} set aside a document")
         return {"ok": True}
 
 
 @app.get("/api/documents/{did}/file")
-def download(did: int):
+def download(did: int, user: dict = Depends(auth.current)):
     with db.tx() as c:
-        d = db.row(c, "SELECT * FROM documents WHERE id=?", (did,))
-    if not d or not Path(d["stored_path"]).exists():
+        d = _doc_for(c, did, user)
+    if not d["stored_path"] or not Path(d["stored_path"]).exists():
         raise HTTPException(404)
     return FileResponse(d["stored_path"], filename=Path(d["filename"]).name)
 
 
+def _zip_response(c, client_ids: list[int], name: str, user: dict) -> FileResponse:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip", dir=db.DATA_DIR)
+    with tmp:
+        n = archive.export_clients(c, client_ids, tmp)
+    db.log(c, user["id"], "export", "client", client_ids[0] if len(client_ids) == 1 else None,
+           f"{user['name']} downloaded {n} files as a zip")
+    return FileResponse(tmp.name, filename=name, media_type="application/zip",
+                        background=BackgroundTask(os.unlink, tmp.name))
+
+
+@app.get("/api/clients/{cid}/export")
+def export_client(cid: int, user: dict = Depends(auth.current)):
+    auth.require(user, "export")
+    with db.tx() as c:
+        auth.require_client(c, user, cid)
+        cl = db.row(c, "SELECT name FROM clients WHERE id=?", (cid,))
+        if not cl:
+            raise HTTPException(404)
+        return _zip_response(c, [cid], f"{archive._safe(cl['name'])} - {engine.today():%Y-%m-%d}.zip", user)
+
+
+@app.get("/api/export")
+def export_all(user: dict = Depends(auth.current)):
+    auth.require(user, "export")
+    with db.tx() as c:
+        ic, ia = scope_sql(c, user, "id")
+        ids = [r["id"] for r in db.rows(c, "SELECT id FROM clients WHERE archived=0" + ic + " ORDER BY name", ia)]
+        if not ids:
+            raise HTTPException(400, "No clients to export")
+        firm = archive._safe(db.get_setting(c, "firm_name", "office"))
+        return _zip_response(c, ids, f"{firm} - all clients - {engine.today():%Y-%m-%d}.zip", user)
+
+
 # ============================================================== outbox
 @app.post("/api/clients/{cid}/chase")
-def chase(cid: int, x_user: int | None = Header(None)):
+def chase(cid: int, user: dict = Depends(auth.current)):
     with db.tx() as c:
-        user = current_user(c, x_user)
+        auth.require_client(c, user, cid)
         draft = engine.build_chase(c, cid)
         if not draft:
             raise HTTPException(400, "Nothing pending from this client in the next 45 days")
@@ -579,31 +857,37 @@ def chase(cid: int, x_user: int | None = Header(None)):
 
 
 def _queue_message(c, cid: int, subject: str, body: str, user: dict) -> dict:
-    existing = db.row(c, "SELECT id FROM messages WHERE client_id=? AND status='draft'", (cid,))
+    existing = db.row(c, "SELECT id FROM messages WHERE client_id=? AND status='draft' AND direction='out'", (cid,))
     if existing:
         c.execute("UPDATE messages SET body=?, subject=?, created_at=? WHERE id=?", (body, subject, db.now(), existing["id"]))
         mid = existing["id"]
     else:
-        mid = c.execute("INSERT INTO messages(client_id,channel,subject,body,status,created_at) VALUES(?,?,?,?,'draft',?)",
-                        (cid, "whatsapp", subject, body, db.now())).lastrowid
+        mid = c.execute("INSERT INTO messages(client_id,channel,subject,body,status,created_at,direction) "
+                        "VALUES(?,?,?,?,'draft',?,'out')", (cid, "whatsapp", subject, body, db.now())).lastrowid
     db.log(c, user["id"], "chase_draft", "client", cid, f"{user['name']} drafted a document request")
     return _message(c, mid)
 
 
 def _message(c, mid: int) -> dict:
-    m = db.row(c, "SELECT m.*, c.name client_name, c.phone, c.email FROM messages m JOIN clients c ON c.id=m.client_id "
+    m = db.row(c, "SELECT m.*, c.name client_name, c.phone, c.email FROM messages m LEFT JOIN clients c ON c.id=m.client_id "
                   "WHERE m.id=?", (mid,))
     from urllib.parse import quote
-    m["whatsapp_url"] = f"https://wa.me/91{m['phone']}?text={quote(m['body'])}" if m.get("phone") else None
-    m["mailto_url"] = f"mailto:{m['email']}?subject={quote(m['subject'] or '')}&body={quote(m['body'])}" if m.get("email") else None
+    phone = m.get("phone") or m.get("from_phone")
+    m["whatsapp_url"] = f"https://wa.me/91{phone}?text={quote(m['body'] or '')}" if phone else None
+    m["mailto_url"] = f"mailto:{m['email']}?subject={quote(m['subject'] or '')}&body={quote(m['body'] or '')}" if m.get("email") else None
+    m["api_send"] = whatsapp.configured() and bool(phone)
+    m["window_open"] = bool(phone) and whatsapp.window_open(c, phone)
     return m
 
 
 @app.get("/api/messages")
-def messages():
+def messages(user: dict = Depends(auth.current)):
     with db.tx() as c:
-        return [_message(c, m["id"]) for m in db.rows(c, "SELECT id FROM messages WHERE status!='discarded' "
-                                                         "ORDER BY status='sent', id DESC LIMIT 200")]
+        sc, sa = scope_sql(c, user)
+        if sc:
+            sc = " AND (client_id IS NULL" + sc.replace(" AND", " OR", 1) + ")"
+        return [_message(c, m["id"]) for m in db.rows(c, "SELECT id FROM messages WHERE status!='discarded'" + sc +
+                                                         " ORDER BY status IN ('sent','read'), id DESC LIMIT 300", sa)]
 
 
 class MsgAction(BaseModel):
@@ -612,26 +896,62 @@ class MsgAction(BaseModel):
 
 
 @app.post("/api/messages/{mid}")
-def message_action(mid: int, a: MsgAction, x_user: int | None = Header(None)):
+def message_action(mid: int, a: MsgAction, user: dict = Depends(auth.current)):
     with db.tx() as c:
-        user = current_user(c, x_user)
         m = db.row(c, "SELECT * FROM messages WHERE id=?", (mid,))
         if not m:
             raise HTTPException(404)
+        auth.require_client(c, user, m["client_id"])
         if a.body is not None and m["status"] == "draft":
             c.execute("UPDATE messages SET body=? WHERE id=?", (a.body, mid))
-        if a.action == "approve":
-            c.execute("UPDATE messages SET status='approved', approved_by=? WHERE id=?", (user["id"], mid))
-        elif a.action == "sent":
-            if m["status"] == "draft":
-                c.execute("UPDATE messages SET approved_by=? WHERE id=?", (user["id"], mid))
-            c.execute("UPDATE messages SET status='sent', sent_at=? WHERE id=?", (db.now(), mid))
-            db.log(c, user["id"], "chase_sent", "client", m["client_id"], f"{user['name']} sent a document request")
+        if a.action == "read":  # an inbound reply has been seen
+            c.execute("UPDATE messages SET status='read' WHERE id=? AND direction='in'", (mid,))
+        elif a.action in ("sent", "send_whatsapp"):
+            auth.require(user, "send_messages")
+            if m["direction"] != "out" or m["status"] == "sent":
+                raise HTTPException(400, "Already sent")
+            if a.action == "send_whatsapp":
+                cl = db.row(c, "SELECT phone FROM clients WHERE id=?", (m["client_id"],)) or {}
+                if not cl.get("phone"):
+                    raise HTTPException(400, "No WhatsApp number on file for this client")
+                try:
+                    wa_id = whatsapp.send(c, cl["phone"], a.body if a.body is not None else m["body"])
+                except whatsapp.SendError as e:
+                    raise HTTPException(400, str(e))
+                c.execute("UPDATE messages SET wa_message_id=? WHERE id=?", (wa_id or None, mid))
+            c.execute("UPDATE messages SET status='sent', sent_at=?, approved_by=?, sent_by=? WHERE id=?",
+                      (db.now(), user["id"], user["id"], mid))
+            db.log(c, user["id"], "chase_sent", "client", m["client_id"],
+                   f"{user['name']} sent a document request{' on WhatsApp' if a.action == 'send_whatsapp' else ''}")
         elif a.action == "discard":
             c.execute("UPDATE messages SET status='discarded' WHERE id=?", (mid,))
         elif a.action != "save":
             raise HTTPException(400, "Unknown action")
         return _message(c, mid)
+
+
+# ============================================================ whatsapp
+@app.get("/api/whatsapp/webhook", include_in_schema=False)
+def wa_verify(request: Request):
+    q = request.query_params
+    if q.get("hub.mode") == "subscribe" and whatsapp.cfg("WA_VERIFY_TOKEN") and \
+            q.get("hub.verify_token") == whatsapp.cfg("WA_VERIFY_TOKEN"):
+        return PlainTextResponse(q.get("hub.challenge", ""))
+    raise HTTPException(403)
+
+
+@app.post("/api/whatsapp/webhook", include_in_schema=False)
+async def wa_inbound(request: Request, background: BackgroundTasks):
+    body = await request.body()
+    if not whatsapp.verify_signature(body, request.headers.get("x-hub-signature-256")):
+        raise HTTPException(403, "Bad signature")
+    try:
+        items = whatsapp.handle_webhook(json.loads(body))
+    except ValueError:
+        raise HTTPException(400)
+    if items:
+        background.add_task(whatsapp.process, items)  # answer Meta immediately; download media afterwards
+    return {"ok": True}
 
 
 # ================================================================ brain
@@ -641,9 +961,9 @@ class Ask(BaseModel):
 
 
 @app.post("/api/ask")
-def ask(q: Ask, x_user: int | None = Header(None)):
+def ask(q: Ask, user: dict = Depends(auth.current)):
     with db.tx() as c:
-        return brain.ask(c, q.text, current_user(c, x_user), q.history)
+        return brain.ask(c, q.text, user, q.history)
 
 
 class Proposal(BaseModel):
@@ -652,26 +972,27 @@ class Proposal(BaseModel):
 
 
 @app.post("/api/proposals/execute")
-def execute(p: Proposal, x_user: int | None = Header(None)):
+def execute(p: Proposal, user: dict = Depends(auth.current)):
     """The single door through which the brain's suggestions become real - always human-clicked."""
     with db.tx() as c:
-        user = current_user(c, x_user)
         if p.kind == "add_client":
             cl = _create_client(c, ClientIn(**{k: v for k, v in p.payload.items() if k in ClientIn.model_fields}), user)
             return {"ok": True, "message": f"Added {cl['name']} and scheduled their filings.", "client_id": cl["id"]}
         if p.kind == "override_due":
             o = _propose_override(c, OverrideIn(**p.payload), user)
-            if user["role"] == "partner":
+            if auth.can(user, "approve"):
                 c.execute("UPDATE due_overrides SET status='approved', approved_by=? WHERE id=?", (user["id"], o["id"]))
                 engine.sync_obligations(c)
                 return {"ok": True, "message": "Due date updated across all affected clients."}
             return {"ok": True, "message": "Sent to a partner for approval."}
         if p.kind == "transition":
             pl = p.payload
+            _obligation_for(c, int(pl["obligation_id"]), user)
             e = engine.transition(c, int(pl["obligation_id"]), pl["action"], user, pl.get("ack_no"), None, pl.get("note"))
             return {"ok": True, "message": f"{e['form']} {e['period_label']} is now {e['stage'].replace('_', ' ')}."}
         if p.kind == "chase":
             cid = int(p.payload["client_id"])
+            auth.require_client(c, user, cid)
             draft = engine.build_chase(c, cid)
             body = p.payload.get("body") or (draft and draft["body"])
             if not body:
@@ -682,20 +1003,25 @@ def execute(p: Proposal, x_user: int | None = Header(None)):
 
 
 @app.get("/api/activity")
-def activity():
+def activity(user: dict = Depends(auth.current)):
     with db.tx() as c:
-        return db.rows(c, "SELECT a.*, u.name actor_name FROM activity a LEFT JOIN users u ON u.id=a.actor "
-                          "ORDER BY a.id DESC LIMIT 100")
+        rows_ = db.rows(c, "SELECT a.*, u.name actor_name FROM activity a LEFT JOIN users u ON u.id=a.actor "
+                           "ORDER BY a.id DESC LIMIT 100")
+        scope = auth.visible_client_ids(c, user)
+        if scope is not None:
+            rows_ = [r for r in rows_ if r["actor"] == user["id"] or (r["entity"] == "client" and r["entity_id"] in scope)]
+        return rows_
 
 
 @app.post("/api/demo")
-def load_demo(x_user: int | None = Header(None)):
+def load_demo(user: dict = Depends(auth.current)):
+    auth.require(user, "manage_team")
     from . import seed
     with db.tx() as c:
         if db.rows(c, "SELECT id FROM clients LIMIT 1"):
             raise HTTPException(400, "Demo data can only be loaded into an empty office")
-    seed.run()
-    return {"ok": True}
+    logins = seed.run()
+    return {"ok": True, "logins": logins}
 
 
 # ================================================================ static

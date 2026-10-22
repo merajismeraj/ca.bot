@@ -18,8 +18,10 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/uvicorn app.main:app --port 8000          # open http://localhost:8000
 ```
 
-First screen offers **Try with demo data** (six clients, ~110 synthetic files, a few deliberate gaps).
-Or: `docker build -t ca-brain . && docker run -p 8000:8000 -v $PWD/data:/data ca-brain`.
+The first visit sets up the office and its first partner login. Then **Try with demo data** loads six clients, ~110
+synthetic files (including a phone photo that only OCR can read), and two staff logins to try permissions with.
+Install `tesseract-ocr` (and `tesseract-ocr-hin`) for scanned documents — the Docker image includes both:
+`docker build -t ca-brain . && docker run -p 8000:8000 -v $PWD/data:/data ca-brain`.
 
 | Env var | Default | Purpose |
 |---|---|---|
@@ -28,6 +30,12 @@ Or: `docker build -t ca-brain . && docker run -p 8000:8000 -v $PWD/data:/data ca
 | `CABOT_MODEL` | `claude-opus-5-5` | Model for the command bar |
 | `CABOT_LLM` | `1` | `0` forces offline mode |
 | `CABOT_TODAY` | today | Pin the date (demos/tests) |
+| `CABOT_SECURE_COOKIES` | `0` | Set `1` when served over HTTPS |
+| `CABOT_VISION_OCR` | `0` | `1` sends scans Tesseract can't read to Claude vision (file contents leave the office) |
+| `CABOT_OCR_LANGS` | `eng`+`hin` if installed | Tesseract languages |
+| `CABOT_MAX_UPLOAD_MB` / `CABOT_ZIP_MAX_MB` / `CABOT_ZIP_MAX_FILES` | 4096 / 4096 / 10000 | Upload and zip limits |
+| `WA_TOKEN`, `WA_PHONE_NUMBER_ID`, `WA_VERIFY_TOKEN`, `WA_APP_SECRET` | – | WhatsApp Business Cloud API (all four required) |
+| `WA_TEMPLATE`, `WA_TEMPLATE_LANG`, `WA_API_VERSION` | –, `en`, `v21.0` | Approved template for messages outside the 24 h window; Graph API version |
 
 Tests: `.venv/bin/pip install -r requirements-dev.txt && .venv/bin/python -m pytest`
 
@@ -49,17 +57,61 @@ Tests: `.venv/bin/pip install -r requirements-dev.txt && .venv/bin/python -m pyt
   “add client Verma Exports 07AABCV1234D1Z3 audit tds payroll”, “extend GSTR-9 FY 2025-26 to 31 Jan 2027 per notification …”.
   Reads answer instantly; changes come back as proposals with a Confirm button.
 
+## Logins and permissions
+
+Every person signs in with their own email and password (scrypt-hashed; sessions are server-side tokens in an
+HttpOnly cookie, or `Authorization: Bearer` for scripts). Partners invite colleagues from **Settings → Team**; the
+invite produces a one-time password that must be changed on first sign-in. Five failed attempts lock that email for
+15 minutes. Partners hold every permission; for staff each one is a checkbox:
+
+| Permission | Lets them |
+|---|---|
+| Approve | approve filings, due-date extensions, N/A and reopenings, sign off the FY calendar |
+| Clients | add, edit clients |
+| Message | send messages to clients (others can draft) |
+| All clients | see every client — otherwise only clients or filings assigned to them, everywhere including the command bar |
+| Export | download client files as zip |
+| Team | invite people, set permissions, change office settings |
+
+## Zips in, zips out
+
+- **In:** drop any mix of files, folders and zips. Zips inside zips (3 levels), Windows backslash paths, non-UTF-8
+  file names, WhatsApp "Export chat" zips (attachments kept, chat text skipped), Mac/Windows junk files ignored.
+  Password-protected entries, zip bombs, oversize files and unsupported types are listed with a reason instead of
+  failing the whole upload. Large zips are read entry by entry from disk, never loaded into memory.
+- **Out:** **Download zip** on a client (or **Zip all** on Clients) gives `Client / FY / Document type / YYYY-MM file`
+  plus `_index.csv`, `_filings.csv` (every filing with due date, status and ack no.) and `_profile.json`.
+
+## Scanned documents (OCR)
+
+Photos and image-only PDFs that can't be identified from their name are read in the background by Tesseract
+(on the server, nothing leaves the office) and re-classified as soon as the text is in. The Inbox shows
+"Reading the scan…" meanwhile. WhatsApp/phone/scanner filename stamps (`IMG-20260914-WA0003`, `Scan 2026-09-14`)
+are recognised as the date sent, not the accounting period. A person's decision is never overwritten by OCR.
+
+## Two-way WhatsApp
+
+With the WhatsApp Business Cloud API connected, set the webhook in Meta to `https://<your-host>/api/whatsapp/webhook`
+(verify token = `WA_VERIFY_TOKEN`; every delivery is checked against `WA_APP_SECRET`).
+
+- Client sends a PDF, photo or zip to the office number → matched to the client by phone → filed through the same
+  pipeline (OCR included). Unknown numbers land in the Inbox unassigned.
+- Text replies show under the client's **Messages** tab and as "New from clients" in the Outbox.
+- **Send on WhatsApp** on a draft sends from the office number. Inside 24 h of the client's last message it is a
+  normal message; outside it, Meta requires an approved template (`WA_TEMPLATE`, one body parameter that receives
+  the list of documents) — otherwise the app says so and offers the "Open WhatsApp" link from your phone.
+
 ## Human-in-the-loop guardrails
 
 | Step | Gate |
 |---|---|
 | File classification | Below 80 % confidence on client, type **or** period → Inbox review |
 | Prepare → review | Blocked while dependencies are unfiled (e.g. GSTR-9 waits on all GSTR-1/3B) |
-| Review → approved | Partner only |
+| Review → approved | Approve permission (partners) |
 | Approved → filed | Acknowledgement / ARN / SRN mandatory |
-| N/A, reopen, send back | Partner only, reason mandatory |
+| N/A, reopen, send back | Approve permission, reason mandatory |
 | Due-date extension | Staff propose, partner approves; statutory default kept alongside |
-| Client messages | Drafts only; a person sends from their own WhatsApp/email |
+| Client messages | Drafts only; a person with Message permission sends (WhatsApp API, wa.me link or email) |
 | AI command bar | Read-only tools + `propose_*` tools; execution goes through the same gates above |
 | Everything | Activity log |
 
@@ -77,16 +129,19 @@ and record changes as extensions. ROC dates assume an AGM on 30 September.
 
 ## Before going live
 
-- **Authentication is not built in.** The "Working as" switcher is a role selector, not a login. Put the app behind
-  your SSO / reverse proxy and map users, or add auth before exposing it beyond a trusted LAN.
+- Serve over HTTPS (reverse proxy) and set `CABOT_SECURE_COOKIES=1`. WhatsApp webhooks need a public HTTPS URL.
 - Client data is personal data under the DPDP Act, 2023: keep `CABOT_DATA` on an encrypted disk, back it up, restrict access.
 - With `ANTHROPIC_API_KEY` set, the command bar sends client names, filing statuses and due dates (not file contents)
   to the Anthropic API.
-- Scanned PDFs/images are classified from filename and folder only (no OCR yet) and usually land in the Inbox.
+- No 2FA or SSO yet; deactivating a person signs them out everywhere immediately.
 
 ## Layout
 
 ```
+app/auth.py         logins, sessions, permissions, client scoping
+app/archive.py      zip extraction (nested, Windows, WhatsApp exports, safety limits) and organised export
+app/ocr.py          Tesseract / Claude-vision OCR and the background worker
+app/whatsapp.py     WhatsApp Cloud API webhook, media download, sending within Meta's rules
 app/fy.py           FY/AY/period helpers
 app/compliance.py   rule engine: applicability, periods, due dates, required documents, dependencies
 app/classifier.py   file → client / type / period with confidence + reasons; learning tokens
@@ -95,5 +150,5 @@ app/brain.py        command bar: offline parser + Claude tool-use (read tools, p
 app/main.py         FastAPI routes
 app/seed.py         demo office
 static/             no-build UI (vanilla JS)
-tests/              calendar, classifier, API workflow, LLM loop (faked)
+tests/              calendar, classifier, workflow, auth, zips, OCR, WhatsApp (Meta faked), LLM loop (faked)
 ```

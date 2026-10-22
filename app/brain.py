@@ -10,6 +10,7 @@ Two interpreters share the same read/propose functions:
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -21,6 +22,14 @@ from .catalog import GST_STATES, PAN_ENTITY
 from .compliance import RULES, RULES_BY_CODE
 
 MODEL = os.environ.get("CABOT_MODEL", "claude-opus-5-5")
+
+# client ids the person asking may see (None = all); set once per ask() so every read tool honours it
+_scope: contextvars.ContextVar[set[int] | None] = contextvars.ContextVar("scope", default=None)
+
+
+def _visible_clients(conn) -> list[dict]:
+    scope = _scope.get()
+    return [c for c in db.rows(conn, "SELECT * FROM clients WHERE archived=0") if scope is None or c["id"] in scope]
 
 FORM_ALIASES = {
     "gstr-1": ["GSTR1_M", "GSTR1_Q"], "gstr1": ["GSTR1_M", "GSTR1_Q"],
@@ -47,7 +56,7 @@ def find_clients(conn, query: str) -> list[dict]:
         return []
     out = []
     qt = set(classifier.norm_name_tokens(q))
-    for c in db.rows(conn, "SELECT * FROM clients WHERE archived=0"):
+    for c in _visible_clients(conn):
         c = db.client_dict(c)
         names = [c["name"]] + c["aliases"]
         hay = " ".join(n.lower() for n in names)
@@ -62,7 +71,7 @@ def client_in_text(conn, text: str) -> dict | None:
     tl = text.lower()
     toks = set(classifier.tokens(text))
     best, score = None, 0.0
-    for c in db.rows(conn, "SELECT * FROM clients WHERE archived=0"):
+    for c in _visible_clients(conn):
         c = db.client_dict(c)
         for n in [c["name"]] + c["aliases"]:
             nt = classifier.norm_name_tokens(n)
@@ -89,6 +98,9 @@ def list_obligations(conn, client_id=None, start=None, end=None, stages=None, li
         args.append(end)
     sql += " ORDER BY due, client_id"
     out = engine.enrich(conn, db.rows(conn, sql, args))
+    scope = _scope.get()
+    if scope is not None:
+        out = [o for o in out if o["client_id"] in scope]
     if stages:
         out = [o for o in out if o["stage"] in stages]
     return out[:limit]
@@ -450,6 +462,15 @@ def ask(conn, text: str, user: dict, history: list[dict] | None = None) -> dict:
     if not text:
         return {"answer": "Ask me anything — “what's due this week”, “missing docs for Sharma”, "
                           "“extend GSTR-9 FY 2025-26 to 31 Jan 2027”."}
+    from . import auth
+    token = _scope.set(auth.visible_client_ids(conn, user))
+    try:
+        return _ask(conn, text, user, history)
+    finally:
+        _scope.reset(token)
+
+
+def _ask(conn, text: str, user: dict, history: list[dict] | None) -> dict:
     res = local(conn, text, user)
     if res is not None:
         res.setdefault("via", "rules")

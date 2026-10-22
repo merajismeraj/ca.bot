@@ -212,3 +212,24 @@ label.field { display: grid; gap: 4px; font-size: 12px; color: var(--ink-2); fon
   .cal .ev span:last-child { display: none; }
   .hide-sm { display: none; }
 }
+
+/* ---------- auth */
+.auth { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
+.auth-card { width: min(420px, 100%); padding: 26px 28px; }
+.auth-card form { display: grid; gap: 12px; }
+.auth-card .logo { padding: 0 0 14px; }
+.auth-card h1 { margin-top: 4px; }
+.auth-card p { margin: 0; }
+code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; word-break: break-all; }
+
+/* ---------- upload progress */
+.uploading { position: fixed; right: 18px; bottom: 18px; z-index: 150; width: min(340px, calc(100vw - 32px)); }
+.rv.reading { opacity: .75; }
+
+/* ---------- conversation */
+.convo { display: grid; gap: 10px; }
+.bubble { max-width: 75%; padding: 9px 12px; border-radius: 12px; white-space: pre-wrap; }
+.bubble.in { background: var(--bg); justify-self: start; border-bottom-left-radius: 4px; }
+.bubble.out { background: var(--brand-soft); justify-self: end; border-bottom-right-radius: 4px; }
+details summary { cursor: pointer; }
+@media (max-width: 960px) { .uploading { bottom: 74px; } .bubble { max-width: 92%; } }

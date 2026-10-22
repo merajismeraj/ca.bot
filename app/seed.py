@@ -7,10 +7,11 @@ Run: python -m app.seed   (only into an empty data directory)
 from __future__ import annotations
 
 import io
+import json
 import random
 from datetime import date, timedelta
 
-from . import db, engine
+from . import auth, db, engine
 from . import fy as F
 
 CLIENTS = [
@@ -31,6 +32,7 @@ CLIENTS = [
 ]
 
 rng = random.Random(7)
+DEMO_PASSWORD = "demo-office-2026"
 
 
 def bank_csv(holder: str, mk: str) -> bytes:
@@ -72,6 +74,35 @@ def register_xlsx(kind: str, gstin: str, mk: str) -> bytes:
 def annual_txt(title: str, who: str, pan: str, fy: int) -> bytes:
     return (f"{title}\n{who}\nPAN: {pan}\nFinancial Year {fy}-{str(fy + 1)[-2:]}\n"
             f"Assessment Year {fy + 1}-{str(fy + 2)[-2:]}\nAmounts in INR\n").encode()
+
+
+def photo_of_register(client: dict, mk: str) -> bytes:
+    from PIL import Image, ImageDraw, ImageFont
+    img = Image.new("RGB", (1240, 900), (250, 248, 240))
+    d = ImageDraw.Draw(img)
+    font = ImageFont.load_default(size=34)
+    small = ImageFont.load_default(size=28)
+    lines = [(f"PURCHASE REGISTER - {F.month_label(mk).upper()}", font), (client["name"].upper(), font),
+             (f"GSTIN: {client['gstin']}", small), ("", small),
+             ("Bill No      Supplier              Taxable     GST", small)]
+    for i in range(8):
+        lines.append((f"PB/{i + 101}      Supplier {chr(65 + i)} Traders     {rng.randint(10, 99)},{rng.randint(100, 999)}"
+                       f"     {rng.randint(1, 9)},{rng.randint(100, 999)}", small))
+    y = 60
+    for text, f in lines:
+        d.text((60, y), text, fill=(20, 20, 30), font=f)
+        y += 60
+    buf = io.BytesIO()
+    img.rotate(1.2, expand=True, fillcolor=(250, 248, 240)).save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def noise_photo() -> bytes:
+    from PIL import Image
+    img = Image.new("RGB", (640, 480), (rng.randint(0, 255), 120, 90))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    return buf.getvalue()
 
 
 def files() -> list[tuple[str, bytes]]:
@@ -132,14 +163,16 @@ def files() -> list[tuple[str, bytes]]:
         out.append((f"Gupta Kirana/sales {F.month_label(mk)}.csv", f"Sales {gupta['gstin']} {mk}".encode()))
 
     # the usual mess: no names, no dates
-    out.append(("WhatsApp Image 2026-09-14 at 18.22.31.jpeg", b"\xff\xd8\xff\xe0" + bytes(rng.randrange(256) for _ in range(400))))
+    # a phone photo of Sharma's missing September purchase register - only readable with OCR
+    out.append((f"WhatsApp Image {t:%Y-%m-%d} at 18.22.31.jpeg", photo_of_register(sharma, done_months[-1])))
+    out.append(("IMG-20260918-WA0007.jpg", noise_photo()))
     out.append(("RKS_stmt.csv", bank_csv("R K S", done_months[-1]).replace(b"STATEMENT OF ACCOUNT", b"Txn list")))
     out.append(("scan0042.pdf", b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF"))
     out.append(("Patel docs/investment proofs.txt", b"PPF passbook, ELSS statement\nPAN AAAHP3456R\n"))
     return out
 
 
-def run() -> None:
+def run() -> list[dict]:
     from .main import ClientIn, _create_client
 
     db.init()
@@ -148,16 +181,24 @@ def run() -> None:
     with db.tx() as c:
         if db.rows(c, "SELECT id FROM clients LIMIT 1"):
             raise SystemExit("Data directory already has clients; demo not loaded.")
-        if not db.rows(c, "SELECT id FROM users"):
-            c.execute("INSERT INTO users(name, role) VALUES ('Partner', 'partner'), ('Staff', 'staff')")
-        c.execute("UPDATE users SET name='CA Neha Kulkarni' WHERE role='partner' AND name='Partner'")
-        c.execute("UPDATE users SET name='Arjun' WHERE role='staff' AND name='Staff'")
-        if not db.row(c, "SELECT id FROM users WHERE name='Priya'"):
-            c.execute("INSERT INTO users(name, role) VALUES ('Priya', 'staff')")
+        logins = []
+        partner = db.row(c, "SELECT * FROM users WHERE role='partner' AND active=1 ORDER BY id LIMIT 1")
+        if not partner:
+            c.execute("INSERT INTO users(name, role, email, pw_hash, perms) VALUES(?,?,?,?,'[]')",
+                      ("CA Neha Kulkarni", "partner", "neha@demo.local", auth.hash_pw(DEMO_PASSWORD)))
+            logins.append({"name": "CA Neha Kulkarni", "email": "neha@demo.local", "role": "partner"})
+        # Arjun sees every client; Priya only the clients assigned to her - to show per-person access
+        for name, email, perms in (("Arjun", "arjun@demo.local", auth.STAFF_DEFAULT),
+                                   ("Priya", "priya@demo.local", ["send_messages", "manage_clients"])):
+            if not db.row(c, "SELECT id FROM users WHERE email=?", (email,)):
+                c.execute("INSERT INTO users(name, role, email, pw_hash, perms) VALUES(?,?,?,?,?)",
+                          (name, "staff", email, auth.hash_pw(DEMO_PASSWORD), json.dumps(perms)))
+                logins.append({"name": name, "email": email, "role": "staff"})
         db.set_setting(c, "firm_name", "Kulkarni & Co., Chartered Accountants")
         db.set_setting(c, "tracking_start", date(cur, 4, 1).isoformat())
         partner = db.row(c, "SELECT * FROM users WHERE role='partner' ORDER BY id LIMIT 1")
-        staff = db.rows(c, "SELECT * FROM users WHERE role='staff' ORDER BY id")
+        staff = db.rows(c, "SELECT * FROM users WHERE role='staff' AND email LIKE '%@demo.local' ORDER BY id") or \
+            db.rows(c, "SELECT * FROM users WHERE role='staff' ORDER BY id") or [partner]
         for i, spec in enumerate(CLIENTS):
             spec = dict(spec, assignee_id=staff[i % len(staff)]["id"])
             _create_client(c, ClientIn(**spec), partner)
@@ -188,8 +229,10 @@ def run() -> None:
             c.execute("INSERT INTO messages(client_id,channel,subject,body,status,created_at) VALUES(?,?,?,?,'draft',?)",
                       (sharma, "whatsapp", draft["subject"], draft["body"], db.now()))
         db.log(c, partner["id"], "demo", "batch", None, "Demo office loaded")
+    return [dict(l, password=DEMO_PASSWORD) for l in logins]
 
 
 if __name__ == "__main__":
-    run()
+    for l in run():
+        print(f"{l['role']:8} {l['email']:22} {l['password']}")
     print("Demo data loaded.")
