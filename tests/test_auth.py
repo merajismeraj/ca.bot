@@ -91,7 +91,7 @@ def test_upgrade_from_passwordless_install(fresh):
         c.execute("INSERT INTO users(name, role) VALUES ('Partner','partner'), ('Staff','staff')")
     with TestClient(app) as api:
         assert api.get("/api/auth/state").json()["setup_needed"]
-        r = api.post("/api/auth/setup", json={"firm_name": "Old Co", "name": "Neha", "email": "n@x.in", "password": "longenough"})
+        r = api.post("/api/auth/setup", json={"firm_name": "Old Co", "name": "Neha", "email": "n@x.in", "password": "longenough", "accept_terms": True})
         users = api.get("/api/users").json()
         assert r.json()["user"]["id"] == 1 and len(users) == 2  # the old partner record became the login
         staff = next(u for u in users if u["role"] == "staff")

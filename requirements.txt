@@ -6,3 +6,4 @@ pypdf==6.21.2
 pillow==13.0.0
 httpx==0.28.1
 anthropic==2.1.0
+cryptography==50.0.2

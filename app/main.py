@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
-from . import archive, auth, brain, db, engine, ocr, whatsapp
+from . import archive, auth, brain, db, engine, ocr, privacy, storage, whatsapp
 from . import fy as F
 from .catalog import DOC_TYPES, ENTITY_TYPES, GST_STATES, PAN_ENTITY
 from .classifier import GSTIN_RE, PAN_RE
@@ -63,6 +63,7 @@ class SetupIn(BaseModel):
     name: str
     email: str
     password: str
+    accept_terms: bool = False
 
 
 class LoginIn(BaseModel):
@@ -98,6 +99,8 @@ def auth_setup(body: SetupIn, response: Response):
     with db.tx() as c:
         if not auth.setup_needed(c):
             raise HTTPException(400, "This office is already set up — sign in instead")
+        if not body.accept_terms:
+            raise HTTPException(400, "Please accept the Terms of Use to continue")
         auth.validate_pw(body.password)
         if not body.name.strip():
             raise HTTPException(400, "Your name is required")
@@ -112,7 +115,8 @@ def auth_setup(body: SetupIn, response: Response):
         else:
             uid = c.execute("INSERT INTO users(name, role, email, pw_hash, perms, active) VALUES(?,?,?,?,?,1)",
                             (body.name.strip(), "partner", email, auth.hash_pw(body.password), "[]")).lastrowid
-        db.log(c, uid, "setup", "office", None, f"{body.name.strip()} set up the office")
+        db.set_setting(c, "terms_accepted", {"by": uid, "name": body.name.strip(), "email": email, "at": db.now()})
+        db.log(c, uid, "setup", "office", None, f"{body.name.strip()} set up the office and accepted the Terms of Use")
         return _login_response(c, uid, response)
 
 
@@ -707,6 +711,8 @@ async def upload(files: list[UploadFile] = File(...), client_id: int | None = Fo
     with db.tx() as c:
         if client_id:
             auth.require_client(c, user, client_id)
+            if privacy.withdrawn(c, client_id):
+                raise HTTPException(400, "This client has withdrawn consent — new documents can't be added (DPDP s.6(6))")
         for f in files:
             name = (f.filename or "upload").replace("\\", "/")
             head = await f.read(4)
@@ -808,8 +814,15 @@ def download(did: int, user: dict = Depends(auth.current)):
     with db.tx() as c:
         d = _doc_for(c, did, user)
     if not d["stored_path"] or not Path(d["stored_path"]).exists():
-        raise HTTPException(404)
-    return FileResponse(d["stored_path"], filename=Path(d["filename"]).name)
+        raise HTTPException(404, "This file has been erased")
+    with db.tx() as c:
+        db.log(c, user["id"], "doc_view", "document", did, f"{user['name']} opened {Path(d['filename']).name}")
+    import mimetypes
+    from urllib.parse import quote
+    name = Path(d["filename"]).name
+    return Response(storage.read(d["stored_path"]), media_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
+                    headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(name)}",
+                             "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 
 def _zip_response(c, client_ids: list[int], name: str, user: dict) -> FileResponse:
@@ -850,10 +863,16 @@ def export_all(user: dict = Depends(auth.current)):
 def chase(cid: int, user: dict = Depends(auth.current)):
     with db.tx() as c:
         auth.require_client(c, user, cid)
+        _consent_ok(c, cid)
         draft = engine.build_chase(c, cid)
         if not draft:
             raise HTTPException(400, "Nothing pending from this client in the next 45 days")
         return _queue_message(c, cid, draft["subject"], draft["body"], user)
+
+
+def _consent_ok(c, cid: int | None) -> None:
+    if privacy.withdrawn(c, cid):
+        raise HTTPException(400, "This client has withdrawn consent — don't contact them for documents (DPDP s.6(6))")
 
 
 def _queue_message(c, cid: int, subject: str, body: str, user: dict) -> dict:
@@ -910,6 +929,8 @@ def message_action(mid: int, a: MsgAction, user: dict = Depends(auth.current)):
             auth.require(user, "send_messages")
             if m["direction"] != "out" or m["status"] == "sent":
                 raise HTTPException(400, "Already sent")
+            if m["subject"] not in ("Personal data breach notice", "Privacy notice"):
+                _consent_ok(c, m["client_id"])
             if a.action == "send_whatsapp":
                 cl = db.row(c, "SELECT phone FROM clients WHERE id=?", (m["client_id"],)) or {}
                 if not cl.get("phone"):
@@ -993,6 +1014,7 @@ def execute(p: Proposal, user: dict = Depends(auth.current)):
         if p.kind == "chase":
             cid = int(p.payload["client_id"])
             auth.require_client(c, user, cid)
+            _consent_ok(c, cid)
             draft = engine.build_chase(c, cid)
             body = p.payload.get("body") or (draft and draft["body"])
             if not body:
@@ -1022,6 +1044,248 @@ def load_demo(user: dict = Depends(auth.current)):
             raise HTTPException(400, "Demo data can only be loaded into an empty office")
     logins = seed.run()
     return {"ok": True, "logins": logins}
+
+
+# ============================================================== privacy
+@app.get("/api/public/info")
+def public_info(request: Request):
+    """Everything the public privacy policy and terms pages show. No login needed, no personal data."""
+    with db.tx() as c:
+        s = privacy.settings(c)
+        return {
+            "firm_name": db.get_setting(c, "firm_name", "Your CA Office"),
+            "officer_name": s["officer_name"], "officer_email": s["officer_email"], "officer_phone": s["officer_phone"],
+            "firm_address": s["firm_address"], "retention_years": s["retention_years"], "response_days": s["response_days"],
+            "jurisdiction": s["jurisdiction"], "policy_updated": s["policy_updated"],
+            "provider_name": os.environ.get("CABOT_PROVIDER_NAME", "the provider of this software"),
+            "shared_with": privacy.shared_with(c), "encrypted": storage.enabled(),
+            "purposes": privacy.PURPOSES,
+        }
+
+
+@app.get("/privacy", include_in_schema=False)
+def privacy_page():
+    return FileResponse(STATIC / "privacy.html")
+
+
+@app.get("/terms", include_in_schema=False)
+def terms_page():
+    return FileResponse(STATIC / "terms.html")
+
+
+def _privacy_admin(user: dict) -> None:
+    if not (auth.can(user, "manage_team") or auth.can(user, "approve")):
+        raise HTTPException(403, "Only partners or team admins can manage data protection")
+
+
+class PrivacySettingsIn(BaseModel):
+    officer_name: str | None = None
+    officer_email: str | None = None
+    officer_phone: str | None = None
+    firm_address: str | None = None
+    retention_years: int | None = None
+    response_days: int | None = None
+    jurisdiction: str | None = None
+    policy_updated: str | None = None
+    public_url: str | None = None
+
+
+@app.post("/api/privacy/settings")
+def privacy_settings(body: PrivacySettingsIn, user: dict = Depends(auth.current)):
+    auth.require(user, "manage_team")
+    with db.tx() as c:
+        out = privacy.save_settings(c, body.model_dump())
+        db.log(c, user["id"], "privacy_settings", "privacy", None, f"{user['name']} updated the privacy settings")
+        return out
+
+
+@app.get("/api/privacy/overview")
+def privacy_overview(user: dict = Depends(auth.current)):
+    _privacy_admin(user)
+    t = engine.today()
+    with db.tx() as c:
+        reqs = db.rows(c, "SELECT r.*, c.name client_name FROM dsr r LEFT JOIN clients c ON c.id=r.client_id "
+                          "ORDER BY r.status='open' DESC, r.due_at")
+        for r in reqs:
+            r["overdue"] = r["status"] == "open" and r["due_at"] < t.isoformat()
+            r["kind_label"] = privacy.KINDS[r["kind"]]
+        return {
+            "settings": privacy.settings(c), "kinds": privacy.KINDS, "purposes": privacy.PURPOSES,
+            "checklist": privacy.checklist(c, t), "requests": reqs,
+            "breaches": [privacy.breach(c, b["id"]) for b in db.rows(c, "SELECT id FROM breaches ORDER BY id DESC")],
+            "retention_due": privacy.retention_due(c, t),
+        }
+
+
+class RequestIn(BaseModel):
+    kind: str
+    client_id: int | None = None
+    requester: str = ""
+    details: str = ""
+    channel: str = ""
+    received_at: str | None = None
+
+
+@app.post("/api/privacy/requests")
+def new_request(body: RequestIn, user: dict = Depends(auth.current)):
+    with db.tx() as c:
+        if body.client_id:
+            auth.require_client(c, user, body.client_id)
+        try:
+            return privacy.create_request(c, body.kind, user, body.client_id, body.requester, body.details, body.channel,
+                                          body.received_at)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+
+class CloseIn(BaseModel):
+    response: str
+    status: str = "closed"
+
+
+@app.post("/api/privacy/requests/{rid}/close")
+def close_request(rid: int, body: CloseIn, user: dict = Depends(auth.current)):
+    _privacy_admin(user)
+    if body.status not in ("closed", "declined"):
+        raise HTTPException(400, "Status must be closed or declined")
+    with db.tx() as c:
+        try:
+            return privacy.close_request(c, rid, user, body.response, body.status)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+
+@app.get("/api/clients/{cid}/privacy")
+def client_privacy(cid: int, user: dict = Depends(auth.current)):
+    with db.tx() as c:
+        auth.require_client(c, user, cid)
+        if not db.row(c, "SELECT id FROM clients WHERE id=?", (cid,)):
+            raise HTTPException(404)
+        return {"summary": privacy.access_summary(c, cid),
+                "log": db.rows(c, "SELECT l.*, u.name by_name FROM consent_log l LEFT JOIN users u ON u.id=l.recorded_by "
+                                  "WHERE client_id=? ORDER BY l.id DESC", (cid,)),
+                "requests": db.rows(c, "SELECT * FROM dsr WHERE client_id=? ORDER BY id DESC", (cid,)),
+                "purposes": privacy.PURPOSES}
+
+
+class ConsentIn(BaseModel):
+    action: str
+    channel: str = ""
+    purposes: list[str] = []
+    notes: str = ""
+    is_minor: bool | None = None
+    guardian_name: str | None = None
+
+
+@app.post("/api/clients/{cid}/consent")
+def client_consent(cid: int, body: ConsentIn, user: dict = Depends(auth.current)):
+    with db.tx() as c:
+        auth.require_client(c, user, cid)
+        try:
+            return db.client_dict(privacy.record_consent(c, cid, body.action, user, body.channel, body.purposes, body.notes,
+                                                         body.is_minor, body.guardian_name))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+
+@app.post("/api/clients/{cid}/privacy-notice")
+def client_notice(cid: int, request: Request, user: dict = Depends(auth.current)):
+    with db.tx() as c:
+        auth.require_client(c, user, cid)
+        cl = db.row(c, "SELECT * FROM clients WHERE id=?", (cid,))
+        if not cl:
+            raise HTTPException(404)
+        m = _queue_message(c, cid, "Privacy notice", privacy.notice_message(c, cl, str(request.base_url)), user)
+        privacy.record_consent(c, cid, "notice_sent", user, "draft")
+        return m
+
+
+class EraseIn(BaseModel):
+    confirm_name: str
+    dsr_id: int | None = None
+
+
+@app.post("/api/clients/{cid}/erase")
+def erase(cid: int, body: EraseIn, user: dict = Depends(auth.current)):
+    auth.require(user, "manage_team")
+    with db.tx() as c:
+        cl = db.row(c, "SELECT name FROM clients WHERE id=?", (cid,))
+        if not cl:
+            raise HTTPException(404)
+        if body.confirm_name.strip().lower() != cl["name"].strip().lower():
+            raise HTTPException(400, "Type the client's name exactly to confirm erasure")
+        return privacy.erase_client(c, cid, user, engine.today(), body.dsr_id)
+
+
+class PurgeIn(BaseModel):
+    ids: list[int]
+
+
+@app.post("/api/privacy/retention/purge")
+def retention_purge(body: PurgeIn, user: dict = Depends(auth.current)):
+    auth.require(user, "manage_team")
+    with db.tx() as c:
+        return {"erased": privacy.purge(c, body.ids, user, engine.today())}
+
+
+class BreachIn(BaseModel):
+    title: str
+    description: str = ""
+    data_affected: str = ""
+    client_ids: list[int] = []
+    detected_at: str | None = None
+
+
+class BreachPatch(BaseModel):
+    board_intimated_at: str | None = None
+    board_report_at: str | None = None
+    principals_notified_at: str | None = None
+    measures: str | None = None
+    status: str | None = None
+
+
+@app.post("/api/privacy/breaches")
+def new_breach(body: BreachIn, user: dict = Depends(auth.current)):
+    _privacy_admin(user)
+    with db.tx() as c:
+        try:
+            return privacy.create_breach(c, user, body.title, body.description, body.data_affected, body.client_ids,
+                                         body.detected_at)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+
+@app.post("/api/privacy/breaches/{bid}")
+def update_breach(bid: int, body: BreachPatch, user: dict = Depends(auth.current)):
+    _privacy_admin(user)
+    with db.tx() as c:
+        if not db.row(c, "SELECT id FROM breaches WHERE id=?", (bid,)):
+            raise HTTPException(404)
+        for k, v in body.model_dump().items():
+            if v is not None:
+                if k == "status" and v not in ("open", "closed"):
+                    raise HTTPException(400, "Status must be open or closed")
+                c.execute(f"UPDATE breaches SET {k}=? WHERE id=?", (v, bid))
+        db.log(c, user["id"], "breach_update", "privacy", bid, f"{user['name']} updated breach #{bid}")
+        return privacy.breach(c, bid)
+
+
+@app.post("/api/privacy/breaches/{bid}/notify")
+def notify_breach(bid: int, user: dict = Depends(auth.current)):
+    """Draft a notice to every affected client (s.8(6)). Drafts land in the Outbox for a person to send."""
+    _privacy_admin(user)
+    with db.tx() as c:
+        b = privacy.breach(c, bid)
+        n = 0
+        for cid in b["client_ids"]:
+            cl = db.row(c, "SELECT * FROM clients WHERE id=?", (cid,))
+            if cl:
+                c.execute("INSERT INTO messages(client_id,channel,subject,body,status,created_at,direction) "
+                          "VALUES(?,?,?,?,'draft',?,'out')",
+                          (cid, "whatsapp", "Personal data breach notice", privacy.breach_message(c, b, cl), db.now()))
+                n += 1
+        db.log(c, user["id"], "breach_notify", "privacy", bid, f"{user['name']} drafted {n} breach notices")
+        return {"drafted": n}
 
 
 # ================================================================ static

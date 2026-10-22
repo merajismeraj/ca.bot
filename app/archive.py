@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import IO, Iterator
 
-from . import db
+from . import db, storage
 from . import fy as F
 from .catalog import DOC_TYPES
 
@@ -150,7 +150,7 @@ def export_clients(conn, client_ids: list[int], out: IO[bytes]) -> int:
                     arc = f"{stem} ({k}){ext}"
                     k += 1
                 used.add(arc)
-                z.write(d["stored_path"], arc)
+                z.writestr(arc, storage.read(d["stored_path"]))
                 w.writerow([arc, d["filename"], label, prefix, fy_dir,
                             "checked by a person" if d["status"] == "confirmed" else "auto-filed",
                             d["confidence"], d["uploaded_at"]])

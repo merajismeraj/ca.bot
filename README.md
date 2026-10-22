@@ -31,6 +31,9 @@ Install `tesseract-ocr` (and `tesseract-ocr-hin`) for scanned documents — the 
 | `CABOT_LLM` | `1` | `0` forces offline mode |
 | `CABOT_TODAY` | today | Pin the date (demos/tests) |
 | `CABOT_SECURE_COOKIES` | `0` | Set `1` when served over HTTPS |
+| `CABOT_DATA_KEY` | – | 32-byte base64 key; encrypts client files at rest (AES-256-GCM) |
+| `CABOT_PROVIDER_NAME` | "the provider of this software" | Name used in the Terms and Privacy Policy |
+| `CABOT_BACKUPS_CONFIRMED` | – | Set `1` once encrypted backups and a restore have been tested (checklist item) |
 | `CABOT_VISION_OCR` | `0` | `1` sends scans Tesseract can't read to Claude vision (file contents leave the office) |
 | `CABOT_OCR_LANGS` | `eng`+`hin` if installed | Tesseract languages |
 | `CABOT_MAX_UPLOAD_MB` / `CABOT_ZIP_MAX_MB` / `CABOT_ZIP_MAX_FILES` | 4096 / 4096 / 10000 | Upload and zip limits |
@@ -101,6 +104,35 @@ With the WhatsApp Business Cloud API connected, set the webhook in Meta to `http
   normal message; outside it, Meta requires an approved template (`WA_TEMPLATE`, one body parameter that receives
   the list of documents) — otherwise the app says so and offers the "Open WhatsApp" link from your phone.
 
+## Data protection (DPDP Act, 2023)
+
+The CA firm running this software is the **Data Fiduciary** for its clients' personal data. The software gives it
+the controls and records the Act and the DPDP Rules, 2025 expect; it does not make the firm compliant by itself
+(see the Terms). Partners manage everything from the **Privacy** page:
+
+| Obligation | What the software does |
+|---|---|
+| Notice & consent (s.5, s.6) | Drafts a privacy notice per client (links to `/privacy`), records consent with channel and purposes, consent log |
+| Withdrawal (s.6(4),(6)) | One click / request; then no chasing, no messages (except breach notices), no new uploads, attachments not stored |
+| Children (s.9) | Minor flag; consent can't be recorded without a parent/guardian |
+| Rights (s.11–14) | Request register (access, correction, erasure, withdrawal, grievance, nomination) with response deadline (≤ 90 days), overdue alerts, access summary + data copy as zip |
+| Retention & erasure (s.8(7), s.12) | Erasure keeps only records tax / GST / company law require (default 8 years after FY, configurable), anonymises the profile when nothing is held, retention review to purge expired files — always a person's click |
+| Security (s.8(5), Rules) | AES-256-GCM encryption at rest (`CABOT_DATA_KEY`), per-person logins and client scoping, document-access logging, activity log kept ≥ 1 year |
+| Breach (s.8(6), Rules) | Breach register with the 72-hour Board-report clock, client notice drafts |
+| Grievance contact (s.8(9)) | Officer name / email / phone published on the policy |
+| Readiness | Checklist of what's still missing (officer, address, consent coverage, encryption, HTTPS, backups, overdue requests, breaches, retention) |
+
+Public pages, no login: **`/privacy`** (Privacy & Data Protection Policy, filled with the office's details; anything
+not yet set is highlighted) and **`/terms`** (Terms of Use & Disclaimer). The first partner must accept the Terms when
+setting up the office; acceptance is recorded. Set `CABOT_PROVIDER_NAME` to name the software provider in both pages.
+
+Generate an encryption key with `python -m app.storage new-key`, keep it outside the data folder, and convert files
+uploaded earlier with `python -m app.storage encrypt-all`.
+
+**Get both pages reviewed by a lawyer before go-live.** They are templates. A disclaimer limits liability only as far
+as Indian law allows — it cannot remove the firm's statutory duties under the DPDP Act or the penalties for breaching
+them. Check the DPDP Rules' commencement dates for each obligation.
+
 ## Human-in-the-loop guardrails
 
 | Step | Gate |
@@ -130,7 +162,7 @@ and record changes as extensions. ROC dates assume an AGM on 30 September.
 ## Before going live
 
 - Serve over HTTPS (reverse proxy) and set `CABOT_SECURE_COOKIES=1`. WhatsApp webhooks need a public HTTPS URL.
-- Client data is personal data under the DPDP Act, 2023: keep `CABOT_DATA` on an encrypted disk, back it up, restrict access.
+- Fill in the Privacy page (grievance officer, address, jurisdiction, policy date) and clear the checklist.
 - With `ANTHROPIC_API_KEY` set, the command bar sends client names, filing statuses and due dates (not file contents)
   to the Anthropic API.
 - No 2FA or SSO yet; deactivating a person signs them out everywhere immediately.
@@ -138,6 +170,8 @@ and record changes as extensions. ROC dates assume an AGM on 30 September.
 ## Layout
 
 ```
+app/privacy.py      DPDP: consent, rights requests, erasure with legal hold, retention, breaches, checklist
+app/storage.py      encrypted file storage
 app/auth.py         logins, sessions, permissions, client scoping
 app/archive.py      zip extraction (nested, Windows, WhatsApp exports, safety limits) and organised export
 app/ocr.py          Tesseract / Claude-vision OCR and the background worker
@@ -149,6 +183,6 @@ app/engine.py       calendar sync, readiness, workflow state machine, ingest, fo
 app/brain.py        command bar: offline parser + Claude tool-use (read tools, propose_* tools)
 app/main.py         FastAPI routes
 app/seed.py         demo office
-static/             no-build UI (vanilla JS)
+static/             no-build UI (vanilla JS); privacy.html / terms.html public policy pages
 tests/              calendar, classifier, workflow, auth, zips, OCR, WhatsApp (Meta faked), LLM loop (faked)
 ```

@@ -74,12 +74,13 @@ const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = se
 // ------------------------------------------------------------------ shell
 const NAV = [
   ["today", "◎", "Today"], ["inbox", "⇪", "Inbox"], ["calendar", "▦", "Calendar"],
-  ["clients", "◫", "Clients"], ["outbox", "✉", "Outbox"], ["settings", "⚙", "Settings"],
+  ["clients", "◫", "Clients"], ["outbox", "✉", "Outbox"], ["privacy", "⛨", "Privacy"], ["settings", "⚙", "Settings"],
 ];
+const privacyAdmin = () => can("manage_team") || can("approve");
 function renderNav() {
   const route = location.hash.slice(2).split("/")[0] || "today";
   const badge = { inbox: S.counts.inbox, outbox: (S.counts.outbox || 0) + (S.counts.replies || 0), calendar: S.counts.overrides };
-  fill($("#nav"), ...NAV.map(([k, ico, label]) =>
+  fill($("#nav"), ...NAV.filter(([k]) => k !== "privacy" || privacyAdmin()).map(([k, ico, label]) =>
     h("a", { href: `#/${k}`, class: route === k ? "on" : "" }, h("span", { class: "ico" }, ico), h("span", { class: "label" }, label),
       badge[k] ? h("span", { class: "badge" + (k === "outbox" ? " soft" : "") }, badge[k]) : null)));
   $("#firm-name").textContent = S.boot.firm_name;
@@ -89,7 +90,8 @@ function renderNav() {
         h("div", { class: "small muted" }, S.me.role === "partner" ? "Partner" : "Staff"))),
     h("div", { class: "row", style: "margin-top:8px" },
       h("button", { class: "btn sm ghost", onclick: () => changePassword() }, "Password"),
-      h("button", { class: "btn sm ghost right", onclick: () => safely(async () => { await api("POST", "/api/auth/logout"); S.me = null; showAuth(); }) }, "Sign out")));
+      h("button", { class: "btn sm ghost right", onclick: () => safely(async () => { await api("POST", "/api/auth/logout"); S.me = null; showAuth(); }) }, "Sign out")),
+    h("div", { class: "small muted", style: "margin-top:8px" }, h("a", { href: "/privacy", target: "_blank" }, "Privacy"), " · ", h("a", { href: "/terms", target: "_blank" }, "Terms")));
   const cur = S.boot.fys.find(f => f.current);
   fill($("#fy-chip"), h("a", { href: "#/calendar", class: "pill " + (cur.signed_off ? "approved" : "awaiting_docs") },
     cur.label, " · ", cur.signed_off ? "calendar signed off ✓" : "calendar needs partner sign-off"));
@@ -626,7 +628,7 @@ async function viewClient(page, id) {
   const done = d.obligations.filter(o => ["filed", "na"].includes(o.status)).reverse();
   const unread = d.conversation.filter(m => m.direction === "in" && m.status === "received").length;
   const tabs = [["filings", `Filings (${open.length})`], ["vault", "Document vault"], ["history", `Filed (${done.length})`],
-    ["messages", `Messages${unread ? ` (${unread} new)` : ""}`], ["activity", "Activity"]];
+    ["messages", `Messages${unread ? ` (${unread} new)` : ""}`], ["privacy", "Privacy"], ["activity", "Activity"]];
   const up = h("input", { type: "file", multiple: true, class: "hidden", onchange: e => upload([...e.target.files], c.id) });
   let content;
   if (tab === "filings") {
@@ -643,6 +645,7 @@ async function viewClient(page, id) {
       h("div", {}, m.body), h("div", { class: "small muted" }, (m.sent_at || m.created_at).replace("T", " ").slice(0, 16), m.direction === "out" ? ` · ${m.status}` : ""))) :
     h("span", { class: "muted" }, "No messages yet. Client replies on the office WhatsApp number show up here, and their attachments are filed automatically."));
   if (tab === "messages" && unread) d.conversation.filter(m => m.direction === "in" && m.status === "received").forEach(m => api("POST", `/api/messages/${m.id}`, { action: "read" }).catch(() => {}));
+  if (tab === "privacy") content = await clientPrivacy(c, reload);
   if (tab === "activity") content = h("div", { class: "card pad" }, d.activity.length ? d.activity.map(a => h("div", { class: "small", style: "padding:5px 0;border-bottom:1px solid var(--line)" },
     h("span", { class: "muted" }, a.at.replace("T", " ").slice(0, 16), " · "), a.text)) : h("span", { class: "muted" }, "No activity yet."));
   if (tab === "vault") content = h("div", {}, d.unsorted.length ? h("div", { class: "banner warn" }, `${d.unsorted.length} file(s) for this client need a look in the Inbox.`, h("a", { class: "btn sm right", href: "#/inbox" }, "Open Inbox")) : null,
@@ -655,7 +658,7 @@ async function viewClient(page, id) {
     h("a", { href: "#/clients", class: "small" }, "← All clients"),
     h("div", { class: "row wrap", style: "margin-top:8px" },
       h("div", { class: "avatar", style: "width:44px;height:44px;font-size:15px" }, initials(c.name)),
-      h("div", { class: "grow" }, h("h1", {}, c.name),
+      h("div", { class: "grow" }, h("h1", {}, c.name, " ", consentPill(c)),
         h("div", { class: "muted small" }, [S.boot.entity_types[c.entity_type], c.pan, c.gstin, c.gst_scheme !== "none" ? `GST ${c.gst_scheme}` : null,
           c.gst_state ? S.boot.states[c.gst_state] : null, ...FLAGS.filter(([k]) => c[k]).map(x => x[1])].filter(Boolean).join(" · "))),
       up,
@@ -802,6 +805,171 @@ function changePassword(forced) {
   if (forced) { document.querySelector(".scrim").onclick = null; dr.querySelector("header button").remove(); }
 }
 
+// --------------------------------------------------------------- PRIVACY
+const CONSENT = { given: ["approved", "Consent ✓"], withdrawn: ["awaiting_docs", "Consent withdrawn"], pending: ["na", "Consent pending"] };
+function consentPill(c) {
+  const [cls, label] = CONSENT[c.consent_status || "pending"] || CONSENT.pending;
+  return h("span", { class: `pill ${cls}`, style: "font-size:12px;vertical-align:middle", title: "DPDP consent status — see the Privacy tab" }, label);
+}
+
+async function clientPrivacy(c, reload) {
+  const d = await api("GET", `/api/clients/${c.id}/privacy`);
+  const sum = d.summary;
+  const sendNotice = () => safely(async () => { const m = await api("POST", `/api/clients/${c.id}/privacy-notice`); openMessage(m, reload); });
+  const recordConsent = () => {
+    const ch = h("select", { class: "input" }, ["WhatsApp reply", "Signed engagement letter", "Email", "In person"].map(x => h("option", {}, x)));
+    const boxes = d.purposes.map(p => { const cb = h("input", { type: "checkbox", checked: true, value: p }); return [cb, h("label", { class: "toggle on" }, cb, p)]; });
+    const minor = h("input", { type: "checkbox", checked: !!c.is_minor });
+    const guardian = h("input", { class: "input", value: c.guardian_name || "", placeholder: "Parent / lawful guardian giving consent" });
+    const notes = h("input", { class: "input", placeholder: "e.g. replied “I agree” on 22 Oct" });
+    drawer(`Record consent · ${c.name}`, [
+      h("div", { class: "hint" }, "Record consent only after the client has received the privacy notice and agreed (DPDP s.5–6)."),
+      h("label", { class: "field" }, "How was consent given?", ch),
+      h("div", { class: "small muted" }, "Purposes consented to"), h("div", { style: "display:grid;gap:6px" }, boxes.map(b => b[1])),
+      h("label", { class: "toggle" }, minor, "Client is a minor (under 18)"), h("label", { class: "field" }, "Guardian (required for minors — s.9)", guardian),
+      h("label", { class: "field" }, "Notes", notes),
+    ], [h("button", { class: "btn", onclick: closeDrawer }, "Cancel"), h("button", { class: "btn primary", onclick: () => safely(async () => {
+      await api("POST", `/api/clients/${c.id}/consent`, { action: "given", channel: ch.value, notes: notes.value,
+        purposes: boxes.filter(b => b[0].checked).map(b => b[0].value), is_minor: minor.checked, guardian_name: guardian.value });
+      closeDrawer(); toast("Consent recorded"); reload();
+    }) }, "Record consent")]);
+  };
+  const withdraw = async () => {
+    const v = await ask(`Withdraw consent · ${c.name}`, [{ name: "notes", label: "How did they withdraw? (date, channel)", required: true }], "Record withdrawal");
+    if (v) safely(async () => { await api("POST", `/api/clients/${c.id}/consent`, { action: "withdrawn", notes: v.notes }); toast("Withdrawal recorded — no more chasing or uploads for this client"); reload(); });
+  };
+  const logRequest = () => newRequest(c, reload);
+  const erase = async () => {
+    const v = await ask(`Erase ${c.name}'s personal data`, [{ name: "confirm", label: `Type “${c.name}” to confirm`, required: true }], "Erase");
+    if (v) safely(async () => { const r = await api("POST", `/api/clients/${c.id}/erase`, { confirm_name: v.confirm }); drawer("Erasure done", h("p", {}, r.message)); });
+  };
+  return h("div", { style: "display:grid;gap:14px" },
+    h("div", { class: "card pad" },
+      h("div", { class: "row wrap" }, h("h2", { class: "grow", style: "margin:0" }, "Notice & consent ", consentPill(c)),
+        h("button", { class: "btn sm", onclick: sendNotice }, "Send privacy notice"),
+        h("button", { class: "btn sm primary", onclick: recordConsent }, "Record consent"),
+        c.consent_status !== "withdrawn" ? h("button", { class: "btn sm ghost danger", onclick: withdraw }, "Withdraw") : null),
+      h("div", { class: "small muted", style: "margin-top:6px" }, c.notice_at ? `Notice sent ${c.notice_at.slice(0, 10)}` : "Privacy notice not sent yet",
+        c.is_minor ? ` · Minor — guardian: ${c.guardian_name || "not recorded"}` : ""),
+      d.log.length ? h("table", { class: "table", style: "margin-top:8px" }, d.log.map(l => h("tr", {},
+        h("td", { class: "small" }, l.at.replace("T", " ").slice(0, 16)), h("td", {}, l.action.replace("_", " ")), h("td", { class: "small muted" }, [l.channel, l.notes].filter(Boolean).join(" · ")), h("td", { class: "small muted" }, l.by_name || "")))) : null),
+    h("div", { class: "card pad" },
+      h("div", { class: "row wrap" }, h("h2", { class: "grow", style: "margin:0" }, "What we hold (access summary, s.11)"),
+        can("export") ? h("a", { class: "btn sm", href: `/api/clients/${c.id}/export` }, "⇩ Copy of their data (zip)") : null),
+      h("ul", { class: "small" }, sum.documents.map(x => h("li", {}, `${x.type}: ${x.count} file(s), ${x.covering}`))),
+      h("div", { class: "small muted" }, "Shared with: ", sum.shared_with.join("; "))),
+    h("div", { class: "card pad" },
+      h("div", { class: "row wrap" }, h("h2", { class: "grow", style: "margin:0" }, "Rights requests"),
+        h("button", { class: "btn sm", onclick: logRequest }, "+ Log a request"),
+        can("manage_team") ? h("button", { class: "btn sm ghost danger", onclick: erase }, "Erase personal data") : null),
+      d.requests.length ? h("table", { class: "table", style: "margin-top:8px" }, d.requests.map(r => h("tr", {},
+        h("td", {}, r.kind), h("td", { class: "small" }, `received ${r.received_at.slice(0, 10)} · due ${r.due_at}`), h("td", {}, h("span", { class: "pill " + (r.status === "open" ? "awaiting_docs" : "filed") }, r.status)), h("td", { class: "small muted" }, r.response || "")))) :
+        h("div", { class: "small muted", style: "margin-top:6px" }, "None. Log access, correction, erasure, withdrawal, grievance or nomination requests here so they're answered on time.")));
+}
+
+async function newRequest(client, after) {
+  const kinds = { access: "Access to their data", correction: "Correction / update", erasure: "Erasure", withdraw: "Withdraw consent", grievance: "Grievance", nomination: "Nomination" };
+  const kind = h("select", { class: "input" }, Object.entries(kinds).map(([k, l]) => h("option", { value: k }, l)));
+  const who = h("input", { class: "input", value: client ? client.name : "", placeholder: "Name of the person asking" });
+  const ch = h("select", { class: "input" }, ["WhatsApp", "Email", "Letter", "In person", "Phone"].map(x => h("option", {}, x)));
+  const det = h("textarea", { class: "input", rows: 3, placeholder: "What exactly did they ask for?" });
+  const rec = h("input", { class: "input", type: "date", value: S.boot.today });
+  drawer("Log a data protection request", [
+    h("div", { class: "hint" }, "Logged requests get a response deadline from your privacy settings and show on the Privacy page until closed."),
+    h("label", { class: "field" }, "Type", kind), h("label", { class: "field" }, "Requested by", who),
+    h("div", { class: "grid2" }, h("label", { class: "field" }, "Received via", ch), h("label", { class: "field" }, "Received on", rec)),
+    h("label", { class: "field" }, "Details", det),
+  ], [h("button", { class: "btn", onclick: closeDrawer }, "Cancel"), h("button", { class: "btn primary", onclick: () => safely(async () => {
+    const r = await api("POST", "/api/privacy/requests", { kind: kind.value, client_id: client ? client.id : null, requester: who.value, details: det.value, channel: ch.value, received_at: rec.value });
+    closeDrawer(); toast(`Logged — respond by ${fmtDate(r.due_at, true)}`); after && after();
+  }) }, "Log request")]);
+}
+
+async function viewPrivacy(page) {
+  if (!privacyAdmin()) return fill(page, h("div", { class: "card empty" }, "Only partners or team admins can see this page."));
+  const d = await api("GET", "/api/privacy/overview");
+  const st = d.settings, admin = can("manage_team");
+  const f = {};
+  const inp = (k, ph, type) => f[k] = h("input", { class: "input", value: st[k] ?? "", placeholder: ph || "", type: type || "text", disabled: !admin || null });
+  const okCount = d.checklist.filter(x => x.ok).length;
+  const closeReq = r => ask(`Close request #${r.id} (${r.kind})`, [{ name: "response", label: "What was done, or why it was declined", type: "textarea", required: true }], "Close")
+    .then(v => v && safely(async () => { await api("POST", `/api/privacy/requests/${r.id}/close`, { response: v.response }); toast("Closed"); route(); }));
+  const sel = new Set();
+  fill(page,
+    h("div", { class: "row wrap" }, h("h1", { class: "grow" }, "Privacy & DPDP"),
+      h("a", { class: "btn", href: "/privacy", target: "_blank" }, "View privacy policy"), h("a", { class: "btn ghost", href: "/terms", target: "_blank" }, "Terms")),
+    h("p", { class: "muted" }, "Your firm is the Data Fiduciary under the Digital Personal Data Protection Act, 2023. These controls help you meet its obligations; they don't make the firm compliant on their own. Have your privacy policy reviewed by a lawyer."),
+    h("div", { class: "group" }, h("div", { class: "row" }, h("h3", { class: "grow" }, "Checklist"), h("span", { class: "muted small" }, `${okCount}/${d.checklist.length} in place`)),
+      h("div", { class: "card list", style: "margin-top:8px" }, d.checklist.map(x => h("div", { class: "item", style: "grid-template-columns:28px 1fr auto;cursor:default" },
+        h("span", { style: `font-size:16px;color:var(--${x.ok ? "green" : "amber"})` }, x.ok ? "✓" : "!"),
+        h("div", {}, h("div", { class: "t1" }, x.title), h("div", { class: "t2" }, x.detail)), h("span", { class: "small muted" }, x.law))))),
+    h("div", { class: "grid2", style: "align-items:start" },
+      h("div", { class: "card pad" }, h("h2", {}, "Published in your privacy policy"),
+        h("div", { class: "grid2" }, h("label", { class: "field" }, "Grievance officer", inp("officer_name", "CA Neha Kulkarni")), h("label", { class: "field" }, "Email", inp("officer_email", "privacy@yourfirm.in"))),
+        h("div", { class: "grid2", style: "margin-top:8px" }, h("label", { class: "field" }, "Phone", inp("officer_phone")), h("label", { class: "field" }, "Courts at (jurisdiction)", inp("jurisdiction", "Mumbai"))),
+        h("label", { class: "field", style: "margin-top:8px" }, "Office address", inp("firm_address")),
+        h("div", { class: "grid3", style: "margin-top:8px" }, h("label", { class: "field" }, "Keep records (years after FY)", inp("retention_years", "8", "number")),
+          h("label", { class: "field" }, "Respond to requests within (days, max 90)", inp("response_days", "30", "number")), h("label", { class: "field" }, "Policy last updated", inp("policy_updated", "", "date"))),
+        h("label", { class: "field", style: "margin-top:8px" }, "Public address of this site (for links in notices)", inp("public_url", "https://brain.yourfirm.in")),
+        admin ? h("button", { class: "btn primary", style: "margin-top:10px", onclick: () => safely(async () => {
+          const body = {}; for (const [k, el] of Object.entries(f)) body[k] = el.type === "number" ? +el.value : el.value;
+          await api("POST", "/api/privacy/settings", body); toast("Saved — the privacy policy is updated"); route();
+        }) }, "Save") : null),
+      h("div", { class: "card pad" }, h("div", { class: "row" }, h("h2", { class: "grow", style: "margin:0" }, "Personal data breaches"), h("button", { class: "btn sm danger", onclick: newBreach }, "+ Record a breach")),
+        d.breaches.length ? d.breaches.map(b => breachCard(b)) : h("p", { class: "small muted" }, "None recorded. If personal data is lost, stolen, or seen by someone who shouldn't, record it here at once — the 72-hour clock starts when you find out."))),
+    h("div", { class: "group", style: "margin-top:18px" }, h("div", { class: "row" }, h("h3", { class: "grow" }, "Rights requests"), h("button", { class: "btn sm", onclick: () => newRequest(null, route) }, "+ Log a request")),
+      d.requests.length ? h("div", { class: "card", style: "margin-top:8px;overflow:auto" }, h("table", { class: "table" },
+        h("tr", {}, h("th", {}, "Request"), h("th", {}, "From"), h("th", {}, "Due"), h("th", {}, "Status"), h("th", {}, "")),
+        d.requests.map(r => h("tr", {}, h("td", {}, r.kind_label, h("div", { class: "small muted" }, r.details)), h("td", {}, r.client_name || r.requester),
+          h("td", { style: r.overdue ? "color:var(--red);font-weight:600" : "" }, fmtDate(r.due_at, true), r.overdue ? " · overdue" : ""),
+          h("td", {}, h("span", { class: "pill " + (r.status === "open" ? "awaiting_docs" : "filed") }, r.status)),
+          h("td", {}, r.status === "open" ? h("div", { class: "row" },
+            r.client_id ? h("a", { class: "btn sm ghost", href: `#/clients/${r.client_id}` }, "Client") : null,
+            h("button", { class: "btn sm", onclick: () => closeReq(r) }, "Close")) : h("span", { class: "small muted" }, r.response)))))) :
+        h("div", { class: "card empty", style: "margin-top:8px" }, "No requests yet.")),
+    h("div", { class: "group" }, h("div", { class: "row" }, h("h3", { class: "grow" }, "Retention review"),
+      d.retention_due.length && admin ? h("button", { class: "btn sm danger", onclick: () => safely(async () => {
+        const ids = sel.size ? [...sel] : d.retention_due.map(x => x.id);
+        if (!confirm(`Permanently erase ${ids.length} file(s) past their retention period?`)) return;
+        const r = await api("POST", "/api/privacy/retention/purge", { ids }); toast(`Erased ${r.erased} files`); route();
+      }) }, "Erase selected") : null),
+      d.retention_due.length ? h("div", { class: "card", style: "margin-top:8px;overflow:auto" }, h("table", { class: "table" },
+        d.retention_due.slice(0, 200).map(x => h("tr", {}, h("td", {}, h("input", { type: "checkbox", onchange: e => e.target.checked ? sel.add(x.id) : sel.delete(x.id) })),
+          h("td", {}, x.filename), h("td", {}, x.client_name || "—"), h("td", { class: "small muted" }, `kept until ${x.hold_until}`))))) :
+        h("div", { class: "card empty", style: "margin-top:8px" }, `Nothing past the ${st.retention_years}-year retention period.`)));
+}
+
+function breachCard(b) {
+  const stamp = (field, label) => b[field] ? h("div", { class: "small" }, "✓ ", label, " ", b[field].replace("T", " ").slice(0, 16)) :
+    h("button", { class: "btn sm", onclick: () => safely(async () => { await api("POST", `/api/privacy/breaches/${b.id}`, { [field]: new Date().toISOString().slice(0, 16) }); route(); }) }, `Mark: ${label}`);
+  return h("div", { style: "border-top:1px solid var(--line);padding:10px 0;display:grid;gap:6px" },
+    h("div", { class: "row" }, h("b", { class: "grow" }, b.title), h("span", { class: "pill " + (b.status === "open" ? "awaiting_docs" : "filed") }, b.status)),
+    h("div", { class: "small muted" }, `Found ${b.detected_at.replace("T", " ").slice(0, 16)} · `, b.board_report_at ? "report filed" :
+      h("span", { style: `color:var(--${b.hours_left < 0 ? "red" : "amber"});font-weight:600` }, b.hours_left < 0 ? `72-hour report overdue by ${Math.abs(b.hours_left)} h` : `${b.hours_left} h left for the Board report`)),
+    h("div", { class: "row wrap" }, stamp("board_intimated_at", "Board intimated"), stamp("board_report_at", "72-h report sent"), stamp("principals_notified_at", "Clients notified"),
+      b.client_ids.length ? h("button", { class: "btn sm", onclick: () => safely(async () => { const r = await api("POST", `/api/privacy/breaches/${b.id}/notify`); toast(`${r.drafted} notices drafted in the Outbox`); }) }, "Draft client notices") : null,
+      b.status === "open" ? h("button", { class: "btn sm ghost", onclick: () => safely(async () => { await api("POST", `/api/privacy/breaches/${b.id}`, { status: "closed" }); route(); }) }, "Close") : null));
+}
+
+async function newBreach() {
+  const clients = await api("GET", "/api/clients");
+  const title = h("input", { class: "input", placeholder: "e.g. Laptop with client files stolen" });
+  const desc = h("textarea", { class: "input", rows: 3, placeholder: "What happened, how it was found" });
+  const data = h("input", { class: "input", placeholder: "e.g. bank statements, PAN, contact details" });
+  const when = h("input", { class: "input", type: "datetime-local", value: new Date().toISOString().slice(0, 16) });
+  const picks = clients.map(c => { const cb = h("input", { type: "checkbox", value: c.id }); return [cb, h("label", { class: "toggle" }, cb, c.name)]; });
+  drawer("Record a personal data breach", [
+    h("div", { class: "banner warn", style: "margin:0" }, "Inform the Data Protection Board of India and each affected person without delay; send the Board a detailed report within 72 hours (DPDP s.8(6) and Rules)."),
+    h("label", { class: "field" }, "What happened (short)", title), h("label", { class: "field" }, "Details", desc),
+    h("label", { class: "field" }, "Personal data involved", data), h("label", { class: "field" }, "When you found out", when),
+    h("div", { class: "small muted" }, "Affected clients"), h("div", { class: "row wrap" }, picks.map(p => p[1])),
+  ], [h("button", { class: "btn", onclick: closeDrawer }, "Cancel"), h("button", { class: "btn primary", onclick: () => safely(async () => {
+    await api("POST", "/api/privacy/breaches", { title: title.value, description: desc.value, data_affected: data.value, detected_at: when.value,
+      client_ids: picks.filter(p => p[0].checked).map(p => +p[0].value) });
+    closeDrawer(); toast("Recorded — 72-hour clock started"); route();
+  }) }, "Record")]);
+}
+
 // ----------------------------------------------------------------- AUTH
 async function showAuth() {
   clearTimeout(S.poll);
@@ -826,14 +994,21 @@ async function showAuth() {
     const [nL, name] = field("Your name", { placeholder: "CA Neha Kulkarni", autocomplete: "name" });
     const [eL, email] = field("Email (your sign-in)", { type: "email", autocomplete: "email" });
     const [pL, pw] = field("Password", { type: "password", autocomplete: "new-password", placeholder: "At least 8 characters" });
+    const agree = h("input", { type: "checkbox" });
     form = [h("h1", {}, "Set up your office"), h("p", { class: "muted" }, "You'll be the first partner. You can invite your team next."),
-      fL, nL, eL, pL, err, h("button", { class: "btn primary", type: "submit" }, "Create office")];
-    form.onsubmit = () => submit(() => post("/api/auth/setup", { firm_name: firm.value, name: name.value, email: email.value, password: pw.value }));
+      fL, nL, eL, pL,
+      h("label", { class: "small", style: "display:flex;gap:8px;align-items:flex-start" }, agree,
+        h("span", {}, "I accept the ", h("a", { href: "/terms", target: "_blank" }, "Terms of Use & Disclaimer"),
+          " on behalf of the firm, and understand the firm is the Data Fiduciary responsible for DPDP Act compliance.")),
+      err, h("button", { class: "btn primary", type: "submit" }, "Create office")];
+    form.onsubmit = () => submit(() => post("/api/auth/setup", { firm_name: firm.value, name: name.value, email: email.value, password: pw.value, accept_terms: agree.checked }));
   } else {
     const [eL, email] = field("Email", { type: "email", autocomplete: "username" });
     const [pL, pw] = field("Password", { type: "password", autocomplete: "current-password" });
     form = [h("h1", {}, "Sign in"), h("p", { class: "muted" }, st.firm_name || ""), eL, pL, err, h("button", { class: "btn primary", type: "submit" }, "Sign in"),
-      h("div", { class: "small muted" }, "Forgot your password? Ask a partner to reset it from Settings → Team.")];
+      h("div", { class: "small muted" }, "Forgot your password? Ask a partner to reset it from Settings → Team."),
+      h("div", { class: "small muted" }, "By signing in you agree to the ", h("a", { href: "/terms", target: "_blank" }, "Terms"), ". See our ",
+        h("a", { href: "/privacy", target: "_blank" }, "Privacy & Data Protection Policy"), ".")];
     form.onsubmit = () => submit(() => post("/api/auth/login", { email: email.value, password: pw.value }));
   }
   const onsubmit = form.onsubmit;
@@ -937,6 +1112,7 @@ async function route() {
     else if (r === "clients") await viewClients(page);
     else if (r === "outbox") await viewOutbox(page);
     else if (r === "settings") await viewSettings(page);
+    else if (r === "privacy") await viewPrivacy(page);
     else await viewToday(page);
   } catch (e) { fill(page, h("div", { class: "card empty" }, "Couldn't load this page: ", e.message)); }
 }

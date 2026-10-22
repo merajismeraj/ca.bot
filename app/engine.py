@@ -15,7 +15,7 @@ from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path, PurePosixPath
 
-from . import auth, classifier, db, ocr
+from . import auth, classifier, db, ocr, privacy, storage
 from . import fy as F
 from .catalog import DOC_TYPES
 from .compliance import RULES_BY_CODE, generate, required_months
@@ -240,10 +240,14 @@ def ingest(conn, rel_path: str, data: bytes, user: dict | None, batch_id: str, h
     if not data:
         return {"filename": rel_path, "skipped": True, "reason": "Empty file"}
     stored = db.UPLOAD_DIR / f"{sha[:2]}/{sha}{suffix}"
-    stored.parent.mkdir(parents=True, exist_ok=True)
-    stored.write_bytes(data)
-    text = classifier.extract_text(stored)
+    storage.write(stored, data)
+    with storage.plain(stored) as p:
+        text = classifier.extract_text(p)
     r = _classify(conn, rel_path, text, hint_client_id)
+    if r.client_id and privacy.withdrawn(conn, r.client_id):
+        # consent withdrawn: never file silently - a person decides whether the law still requires keeping it
+        r.client_conf = min(r.client_conf, 0.5)
+        r.reasons.insert(0, "This client has withdrawn consent — keep only if the law requires it")
     # scanned / photographed and not identifiable from its name: read it in the background
     ocr_status = "pending" if r.status == "needs_review" and ocr.needs_ocr(stored, text) else ""
     reasons = (["Reading the scanned page…"] if ocr_status else []) + r.reasons

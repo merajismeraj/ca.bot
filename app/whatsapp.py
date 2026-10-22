@@ -123,6 +123,11 @@ def process(items: list[dict]) -> None:
             db.log(c, None, "wa_in", "client" if cid else "whatsapp", cid, f"WhatsApp from {who}: {body[:80]}")
         if it["kind"] not in ("document", "image") or not it.get("media_id"):
             continue
+        with db.tx() as c:
+            from . import privacy
+            if privacy.withdrawn(c, cid):
+                db.log(c, None, "wa_in", "client", cid, "Attachment not stored: client has withdrawn consent")
+                continue
         try:
             data, mime = download_media(it["media_id"])
         except Exception as e:

@@ -128,6 +128,12 @@ def vision(path: Path) -> str:
 
 def read(path: Path) -> tuple[str, str]:
     """Return (text, engine). Empty text means nothing could be read."""
+    from . import storage
+    with storage.plain(path) as p:
+        return _read(p)
+
+
+def _read(path: Path) -> tuple[str, str]:
     text, engine = "", ""
     if tesseract_available():
         try:

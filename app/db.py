@@ -57,6 +57,19 @@ CREATE TABLE IF NOT EXISTS activity (
 CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY, user_id INT NOT NULL REFERENCES users(id), created_at TEXT, expires_at TEXT
 );
+CREATE TABLE IF NOT EXISTS consent_log (
+  id INTEGER PRIMARY KEY, client_id INT NOT NULL, action TEXT NOT NULL, channel TEXT, purposes TEXT, notes TEXT,
+  recorded_by INT, at TEXT
+);
+CREATE TABLE IF NOT EXISTS dsr (
+  id INTEGER PRIMARY KEY, client_id INT, requester TEXT, kind TEXT NOT NULL, details TEXT, channel TEXT,
+  received_at TEXT, due_at TEXT, status TEXT NOT NULL DEFAULT 'open', response TEXT, closed_at TEXT, handled_by INT
+);
+CREATE TABLE IF NOT EXISTS breaches (
+  id INTEGER PRIMARY KEY, title TEXT NOT NULL, description TEXT, data_affected TEXT, client_ids TEXT DEFAULT '[]',
+  detected_at TEXT NOT NULL, board_intimated_at TEXT, board_report_at TEXT, principals_notified_at TEXT,
+  measures TEXT, status TEXT NOT NULL DEFAULT 'open', recorded_by INT
+);
 CREATE TABLE IF NOT EXISTS learned (
   id INTEGER PRIMARY KEY, kind TEXT, token TEXT, value TEXT, created_at TEXT, UNIQUE(kind, token)
 );
@@ -95,6 +108,8 @@ def tx():
 # Columns added after the first release. init() adds whichever are missing, so an
 # existing office database upgrades in place on the next start.
 MIGRATIONS = {
+    "clients": {"consent_status": "TEXT DEFAULT 'pending'", "consent_at": "TEXT", "notice_at": "TEXT",
+                "is_minor": "INT DEFAULT 0", "guardian_name": "TEXT", "erased_at": "TEXT"},
     "users": {"email": "TEXT", "pw_hash": "TEXT", "perms": "TEXT DEFAULT '[]'", "active": "INT DEFAULT 1",
               "must_change_pw": "INT DEFAULT 0", "phone": "TEXT"},
     "documents": {"ocr_status": "TEXT DEFAULT ''", "hint_client_id": "INT", "source": "TEXT DEFAULT 'upload'"},

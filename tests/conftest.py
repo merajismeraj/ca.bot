@@ -34,7 +34,7 @@ def api(fresh):
     from app.main import app
     with TestClient(app) as c:
         r = c.post("/api/auth/setup", json={"firm_name": "Test & Co", "name": "Neha", "email": "neha@x.in",
-                                            "password": "partner-pass"})
+                                            "password": "partner-pass", "accept_terms": True})
         assert r.status_code == 200, r.text
         c.cookies.clear()
         c.partner = bearer(r.json()["token"])
