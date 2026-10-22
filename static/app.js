@@ -721,6 +721,9 @@ async function viewSettings(page) {
         yes(S.boot.ocr.tesseract, "Scanned documents are read on this server (Tesseract).", "Tesseract not installed — scans are sorted by file name only."),
         yes(S.boot.ocr.vision, "Hard-to-read scans fall back to Claude vision (sends the file to Anthropic).", "Claude vision OCR off (set CABOT_VISION_OCR=1 to enable)."),
         yes(S.boot.whatsapp, "WhatsApp Business connected — replies and attachments flow in automatically.", "WhatsApp Business not connected — use “Open WhatsApp” links."),
+        yes(S.boot.google.enabled, `Google sign-in on${S.boot.google.domain ? ` (only @${S.boot.google.domain})` : ""} — invited team members can use their Google account.`,
+          "Google sign-in off (set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)."),
+        h("div", { class: "small muted", style: "margin-top:6px" }, "Google OAuth redirect URI: ", h("code", {}, S.boot.google.redirect_uri)),
         h("div", { class: "small muted", style: "margin-top:6px" }, "WhatsApp webhook URL for Meta: ", h("code", {}, hook)))),
     h("div", { class: "group", style: "margin-top:22px" },
       h("div", { class: "row" }, h("h3", { class: "grow" }, "Team & permissions"),
@@ -743,7 +746,8 @@ function teamRow(u, admin) {
   const isPartner = u.role === "partner";
   const save = patch => safely(async () => { await api("PATCH", `/api/users/${u.id}`, patch); toast("Access updated"); await boot(); });
   return h("tr", { style: u.active ? "" : "opacity:.5" },
-    h("td", {}, h("div", { class: "who" }, h("span", { class: "avatar" }, initials(u.name)), h("div", {}, h("b", {}, u.name), u.email ? h("div", { class: "small muted" }, u.email)
+    h("td", {}, h("div", { class: "who" }, h("span", { class: "avatar" }, initials(u.name)), h("div", {}, h("b", {}, u.name,
+      u.google_linked ? h("span", { class: "pill auth", style: "margin-left:6px;font-size:11px", title: "Signs in with Google" }, "Google") : null), u.email ? h("div", { class: "small muted" }, u.email)
       : admin ? h("a", { href: "#", class: "small", onclick: async e => { e.preventDefault();
           const v = await ask(`Sign-in email for ${u.name}`, [{ name: "email", label: "Email", type: "email", required: true }], "Save");
           if (v) save({ email: v.email }); } }, "Add sign-in email") : h("div", { class: "small muted" }, "no login yet")))),
@@ -757,6 +761,7 @@ function teamRow(u, admin) {
         if (!confirm(`Reset ${u.name}'s password? They'll be signed out everywhere.`)) return;
         const r = await api("POST", `/api/users/${u.id}/reset`); showTempPassword(u.name, u.email, r.temp_password);
       }) }, "Reset password"),
+      u.google_linked ? h("button", { class: "btn sm ghost", title: "They'll need to sign in with Google again (or use a password) to re-link", onclick: () => save({ unlink_google: true }) }, "Unlink Google") : null,
       h("button", { class: "btn sm ghost" + (u.active ? " danger" : ""), onclick: () => save({ active: !u.active }) }, u.active ? "Deactivate" : "Reactivate")) : null));
 }
 
@@ -971,6 +976,17 @@ async function newBreach() {
 }
 
 // ----------------------------------------------------------------- AUTH
+function googleMark() {
+  const ns = "http://www.w3.org/2000/svg", svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 48 48"); svg.setAttribute("width", "18"); svg.setAttribute("height", "18"); svg.setAttribute("aria-hidden", "true");
+  for (const [fill, d] of [["#EA4335", "M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.8 2.4 30.3 0 24 0 14.6 0 6.6 5.4 2.6 13.3l7.9 6.2C12.4 13.6 17.7 9.5 24 9.5z"],
+    ["#4285F4", "M46.1 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.4c-.5 2.9-2.2 5.3-4.6 6.9l7.4 5.8c4.3-4 6.9-9.9 6.9-17.2z"],
+    ["#FBBC05", "M10.5 28.6c-.5-1.4-.8-3-.8-4.6s.3-3.2.8-4.6l-7.9-6.2C.9 16.5 0 20.1 0 24s.9 7.5 2.6 10.8l7.9-6.2z"],
+    ["#34A853", "M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.4-5.8c-2.1 1.4-4.8 2.3-8.5 2.3-6.3 0-11.6-4.1-13.5-9.9l-7.9 6.2C6.6 42.6 14.6 48 24 48z"]]) {
+    const p = document.createElementNS(ns, "path"); p.setAttribute("fill", fill); p.setAttribute("d", d); svg.append(p);
+  }
+  return svg;
+}
 async function showAuth() {
   clearTimeout(S.poll);
   const st = await fetch("/api/auth/state", { credentials: "same-origin" }).then(r => r.json()).catch(() => ({}));
@@ -980,6 +996,12 @@ async function showAuth() {
   let screen = $("#auth");
   if (!screen) { screen = h("div", { id: "auth", class: "auth" }); document.body.append(screen); }
   const err = h("div", { class: "small", style: "color:var(--red);min-height:18px" });
+  const qs = new URLSearchParams(location.search);
+  if (qs.get("auth_error")) { err.textContent = qs.get("auth_error"); history.replaceState(null, "", "/" + location.hash); }
+  const google = st.google && !st.setup_needed ? [
+    h("a", { class: "btn google", href: "/api/auth/google/start" }, googleMark(), "Continue with Google"),
+    st.google_domain ? h("div", { class: "small muted", style: "text-align:center" }, `Use your @${st.google_domain} account`) : null,
+    h("div", { class: "or" }, h("span", {}, "or with email"))] : [];
   const field = (label, attrs) => { const i = h("input", Object.assign({ class: "input" }, attrs)); return [h("label", { class: "field" }, label, i), i]; };
   const submit = async (fn) => { err.textContent = ""; try { await fn(); history.replaceState(null, "", "#/today"); screen.remove(); document.querySelector(".shell").classList.remove("hidden"); await boot(); } catch (e) { err.textContent = e.message; } };
   const post = async (path, body) => {
@@ -1005,7 +1027,7 @@ async function showAuth() {
   } else {
     const [eL, email] = field("Email", { type: "email", autocomplete: "username" });
     const [pL, pw] = field("Password", { type: "password", autocomplete: "current-password" });
-    form = [h("h1", {}, "Sign in"), h("p", { class: "muted" }, st.firm_name || ""), eL, pL, err, h("button", { class: "btn primary", type: "submit" }, "Sign in"),
+    form = [h("h1", {}, "Sign in"), h("p", { class: "muted" }, st.firm_name || ""), ...google, eL, pL, err, h("button", { class: "btn primary", type: "submit" }, "Sign in"),
       h("div", { class: "small muted" }, "Forgot your password? Ask a partner to reset it from Settings → Team."),
       h("div", { class: "small muted" }, "By signing in you agree to the ", h("a", { href: "/terms", target: "_blank" }, "Terms"), ". See our ",
         h("a", { href: "/privacy", target: "_blank" }, "Privacy & Data Protection Policy"), ".")];

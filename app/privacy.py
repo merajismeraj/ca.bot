@@ -207,6 +207,9 @@ def shared_with(conn) -> list[str]:
         out.append("Anthropic PBC (USA) — AI assistant: client names, filing statuses and due dates")
     if ocr.vision_enabled():
         out.append("Anthropic PBC (USA) — reading of scanned documents that local OCR cannot read")
+    from . import google_auth
+    if google_auth.configured():
+        out.append("Google LLC — staff sign-in (name and work email of our team members only)")
     if whatsapp.configured():
         out.append("Meta Platforms (WhatsApp Business) — messages and files you exchange with us on WhatsApp")
     return out

@@ -82,6 +82,7 @@ def require(user: dict, perm: str) -> None:
 def public(user: dict) -> dict:
     out = {k: user.get(k) for k in ("id", "name", "role", "email", "active", "must_change_pw", "phone")}
     out["perms"] = sorted(perms_of(user))
+    out["google_linked"] = bool(user.get("google_sub"))
     return out
 
 

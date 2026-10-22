@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import uuid
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 from collections import defaultdict
 from datetime import date, timedelta
@@ -13,12 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
-from . import archive, auth, brain, db, engine, ocr, privacy, storage, whatsapp
+from . import archive, auth, brain, db, engine, google_auth, ocr, privacy, storage, whatsapp
 from . import fy as F
 from .catalog import DOC_TYPES, ENTITY_TYPES, GST_STATES, PAN_ENTITY
 from .classifier import GSTIN_RE, PAN_RE
@@ -90,7 +91,48 @@ def auth_state(request: Request):
     with db.tx() as c:
         u = auth.user_for_token(c, auth.token_from(request))
         return {"setup_needed": auth.setup_needed(c), "user": auth.public(u) if u else None,
-                "firm_name": db.get_setting(c, "firm_name", "Your CA Office")}
+                "firm_name": db.get_setting(c, "firm_name", "Your CA Office"),
+                "google": google_auth.configured(), "google_domain": google_auth.allowed_domain()}
+
+
+@app.get("/api/auth/google/start", include_in_schema=False)
+def google_start(request: Request):
+    if not google_auth.configured():
+        raise HTTPException(404, "Google sign-in isn't set up for this office")
+    with db.tx() as c:
+        if auth.setup_needed(c):
+            return RedirectResponse("/?auth_error=" + quote("Set up the office first; Google sign-in works after that."))
+        url, browser = google_auth.start(c, str(request.base_url))
+    r = RedirectResponse(url, status_code=302)
+    r.set_cookie(google_auth.STATE_COOKIE, browser, httponly=True, samesite="lax", secure=auth.secure_cookies(),
+                 max_age=int(google_auth.STATE_TTL.total_seconds()), path="/api/auth/google")
+    return r
+
+
+@app.get("/api/auth/google/callback", include_in_schema=False)
+def google_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    def fail(msg: str) -> RedirectResponse:
+        r = RedirectResponse("/?auth_error=" + quote(msg), status_code=302)
+        r.delete_cookie(google_auth.STATE_COOKIE, path="/api/auth/google")
+        return r
+    if error:
+        return fail("Google sign-in was cancelled." if error == "access_denied" else "Google sign-in failed. Please try again.")
+    key = f"google:{request.client.host if request.client else '-'}"
+    try:
+        auth.check_rate(key)
+    except HTTPException as e:
+        return fail(e.detail)
+    with db.tx() as c:
+        try:
+            user = google_auth.finish(c, code, state, request.cookies.get(google_auth.STATE_COOKIE), str(request.base_url))
+        except google_auth.GoogleError as e:
+            auth.record_fail(key)
+            return fail(str(e))  # leaving the block normally commits the state deletion
+        db.log(c, user["id"], "login", "user", user["id"], f"{user['name']} signed in with Google")
+        r = RedirectResponse("/#/today", status_code=302)
+        _login_response(c, user["id"], r)
+    r.delete_cookie(google_auth.STATE_COOKIE, path="/api/auth/google")
+    return r
 
 
 @app.post("/api/auth/setup")
@@ -163,7 +205,7 @@ def change_password(body: PasswordIn, request: Request, user: dict = Depends(aut
 
 # ================================================================ meta
 @app.get("/api/bootstrap")
-def bootstrap(user: dict = Depends(auth.current)):
+def bootstrap(request: Request, user: dict = Depends(auth.current)):
     with db.tx() as c:
         cur = F.fy_of(engine.today())
         signed = {r["fy"]: r for r in db.rows(c, "SELECT * FROM calendar_signoff")}
@@ -172,6 +214,8 @@ def bootstrap(user: dict = Depends(auth.current)):
             "users": [auth.public(u) for u in db.rows(c, "SELECT * FROM users WHERE active=1 ORDER BY id")],
             "perms": auth.PERMS,
             "whatsapp": whatsapp.configured(),
+            "google": {"enabled": google_auth.configured(), "domain": google_auth.allowed_domain(),
+                       "redirect_uri": google_auth.redirect_uri(str(request.base_url))},
             "ocr": {"tesseract": ocr.tesseract_available(), "vision": ocr.vision_enabled()},
             "firm_name": db.get_setting(c, "firm_name", "Your CA Office"),
             "today": engine.today().isoformat(),
@@ -216,6 +260,7 @@ class NewUser(BaseModel):
 
 
 class UserPatch(BaseModel):
+    unlink_google: bool = False
     name: str | None = None
     email: str | None = None
     role: str | None = None
@@ -270,6 +315,8 @@ def edit_user(uid: int, p: UserPatch, user: dict = Depends(auth.current)):
             raise HTTPException(400, "Someone else already uses this email")
         c.execute("UPDATE users SET name=COALESCE(?,name), email=COALESCE(?,email), role=?, perms=?, active=?, "
                   "phone=COALESCE(?,phone) WHERE id=?", (p.name, email, new_role, perms, new_active, p.phone, uid))
+        if p.unlink_google:
+            c.execute("UPDATE users SET google_sub=NULL WHERE id=?", (uid,))
         if not new_active:
             c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
         db.log(c, user["id"], "user_edit", "user", uid, f"{user['name']} updated {target['name']}'s access")

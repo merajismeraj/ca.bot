@@ -37,6 +37,9 @@ Install `tesseract-ocr` (and `tesseract-ocr-hin`) for scanned documents — the 
 | `CABOT_VISION_OCR` | `0` | `1` sends scans Tesseract can't read to Claude vision (file contents leave the office) |
 | `CABOT_OCR_LANGS` | `eng`+`hin` if installed | Tesseract languages |
 | `CABOT_MAX_UPLOAD_MB` / `CABOT_ZIP_MAX_MB` / `CABOT_ZIP_MAX_FILES` | 4096 / 4096 / 10000 | Upload and zip limits |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | – | Sign in with Google (both required) |
+| `GOOGLE_ALLOWED_DOMAIN` | – | Only accept Google Workspace accounts on this domain, e.g. `yourfirm.in` |
+| `CABOT_PUBLIC_URL` | from request | Public https address; used for the Google redirect URI and links in notices |
 | `WA_TOKEN`, `WA_PHONE_NUMBER_ID`, `WA_VERIFY_TOKEN`, `WA_APP_SECRET` | – | WhatsApp Business Cloud API (all four required) |
 | `WA_TEMPLATE`, `WA_TEMPLATE_LANG`, `WA_API_VERSION` | –, `en`, `v21.0` | Approved template for messages outside the 24 h window; Graph API version |
 
@@ -75,6 +78,19 @@ invite produces a one-time password that must be changed on first sign-in. Five 
 | All clients | see every client — otherwise only clients or filings assigned to them, everywhere including the command bar |
 | Export | download client files as zip |
 | Team | invite people, set permissions, change office settings |
+
+### Sign in with Google
+
+Invite-only: a Google account gets in only if its verified email matches an active team member a partner has
+invited (the account is then linked, and later sign-ins match it even if the email changes). Strangers with a
+Google account are turned away. Optionally lock it to your Google Workspace domain. Email + password keeps working,
+so a Google outage or misconfiguration can't lock the office out.
+
+Setup: in Google Cloud Console → APIs & Services → Credentials, create an **OAuth client ID** (type *Web application*),
+add the redirect URI shown in **Settings → Connections** (`https://<your-host>/api/auth/google/callback`), and set
+`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`. The consent screen only needs the `openid`, `email` and `profile` scopes.
+The flow uses PKCE, single-use state bound to the browser (stops login CSRF), and checks issuer, audience, expiry,
+nonce, verified email and Workspace domain.
 
 ## Zips in, zips out
 

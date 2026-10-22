@@ -233,3 +233,8 @@ code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: va
 .bubble.out { background: var(--brand-soft); justify-self: end; border-bottom-right-radius: 4px; }
 details summary { cursor: pointer; }
 @media (max-width: 960px) { .uploading { bottom: 74px; } .bubble { max-width: 92%; } }
+
+/* ---------- Google sign-in */
+.btn.google { justify-content: center; gap: 10px; padding: 9px 12px; font-weight: 600; }
+.or { display: flex; align-items: center; gap: 10px; color: var(--ink-3); font-size: 12px; }
+.or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--line); }

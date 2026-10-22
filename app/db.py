@@ -70,6 +70,9 @@ CREATE TABLE IF NOT EXISTS breaches (
   detected_at TEXT NOT NULL, board_intimated_at TEXT, board_report_at TEXT, principals_notified_at TEXT,
   measures TEXT, status TEXT NOT NULL DEFAULT 'open', recorded_by INT
 );
+CREATE TABLE IF NOT EXISTS oauth_states (
+  state TEXT PRIMARY KEY, nonce TEXT NOT NULL, verifier TEXT NOT NULL, browser TEXT NOT NULL, created_at TEXT
+);
 CREATE TABLE IF NOT EXISTS learned (
   id INTEGER PRIMARY KEY, kind TEXT, token TEXT, value TEXT, created_at TEXT, UNIQUE(kind, token)
 );
@@ -110,7 +113,7 @@ def tx():
 MIGRATIONS = {
     "clients": {"consent_status": "TEXT DEFAULT 'pending'", "consent_at": "TEXT", "notice_at": "TEXT",
                 "is_minor": "INT DEFAULT 0", "guardian_name": "TEXT", "erased_at": "TEXT"},
-    "users": {"email": "TEXT", "pw_hash": "TEXT", "perms": "TEXT DEFAULT '[]'", "active": "INT DEFAULT 1",
+    "users": {"google_sub": "TEXT", "email": "TEXT", "pw_hash": "TEXT", "perms": "TEXT DEFAULT '[]'", "active": "INT DEFAULT 1",
               "must_change_pw": "INT DEFAULT 0", "phone": "TEXT"},
     "documents": {"ocr_status": "TEXT DEFAULT ''", "hint_client_id": "INT", "source": "TEXT DEFAULT 'upload'"},
     "messages": {"direction": "TEXT DEFAULT 'out'", "from_phone": "TEXT", "wa_message_id": "TEXT",
@@ -127,6 +130,7 @@ def init() -> None:
                 if col not in have:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_user_email ON users(email) WHERE email IS NOT NULL")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_user_google ON users(google_sub) WHERE google_sub IS NOT NULL")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_msg_wa ON messages(wa_message_id) WHERE wa_message_id IS NOT NULL")
         c.execute("CREATE INDEX IF NOT EXISTS ix_doc_ocr ON documents(ocr_status)")
 
