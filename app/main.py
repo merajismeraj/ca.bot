@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
-from . import archive, auth, brain, db, engine, google_auth, ocr, privacy, storage, whatsapp
+from . import archive, auth, brain, db, engine, google_auth, ocr, privacy, storage, tenancy, whatsapp
 from . import fy as F
 from .catalog import DOC_TYPES, ENTITY_TYPES, GST_STATES, PAN_ENTITY
 from .classifier import GSTIN_RE, PAN_RE
@@ -30,12 +30,13 @@ MAX_UPLOAD = int(os.environ.get("CABOT_MAX_UPLOAD_MB", 4096)) * 1024 * 1024
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    db.init()
-    with db.tx() as c:
-        if db.get_setting(c, "tracking_start") is None:
-            db.set_setting(c, "tracking_start", engine.today().isoformat())
-        # roll the calendar forward (new FY on 1 April, profile changes, approved extensions)
-        engine.sync_obligations(c)
+    tenancy.init()
+    for f in tenancy.firms("active"):
+        with db.use_firm(f["id"]):
+            with db.tx() as c:
+                auth.ensure_levels(c)
+                # roll the calendar forward (new FY on 1 April, profile changes, approved extensions)
+                engine.sync_obligations(c)
     ocr.start_worker()
     yield
 
@@ -58,25 +59,10 @@ def scope_sql(conn, user: dict, col: str = "client_id") -> tuple[str, list]:
     return f" AND {col} IN ({','.join('?' * len(ids))})", sorted(ids)
 
 
-# ================================================================ auth
-class SetupIn(BaseModel):
-    firm_name: str
-    name: str
-    email: str
-    password: str
-    accept_terms: bool = False
-
-
-class LoginIn(BaseModel):
-    email: str
-    password: str
-
-
-def _login_response(c, user_id: int, response: Response) -> dict:
-    token = auth.new_session(c, user_id)
+# ================================================================ sign-in
+def _set_session_cookie(response: Response, token: str) -> None:
     response.set_cookie(auth.COOKIE, token, httponly=True, samesite="lax", secure=auth.secure_cookies(),
-                        max_age=auth.SESSION_DAYS * 86400, path="/")
-    return {"ok": True, "token": token, "user": auth.public(db.row(c, "SELECT * FROM users WHERE id=?", (user_id,)))}
+                        max_age=tenancy.SESSION_DAYS * 86400, path="/")
 
 
 def _norm_email(e: str) -> str:
@@ -86,23 +72,46 @@ def _norm_email(e: str) -> str:
     return e
 
 
+def _enter_if_single(token: str, email: str) -> None:
+    """One firm → go straight in; several → the person picks."""
+    ms = [m for m in tenancy.memberships(email) if m["status"] == "active"]
+    if len(ms) == 1:
+        tenancy.enter_firm(token, ms[0]["firm_id"], ms[0]["user_id"])
+
+
+def _sign_in(email: str, name: str, sub: str | None) -> str:
+    token = tenancy.new_session(email, name, sub)
+    _enter_if_single(token, email)
+    # link the Google account to each firm's user record (helps the team page show who has signed in)
+    for m in tenancy.memberships(email):
+        with db.use_firm(m["firm_id"]):
+            with db.tx() as c:
+                c.execute("UPDATE users SET google_sub=COALESCE(google_sub, ?), last_login=? WHERE id=?",
+                          (sub, db.now(), m["user_id"]))
+                db.log(c, m["user_id"], "login", "user", m["user_id"], f"{name or email} signed in with Google")
+    return token
+
+
 @app.get("/api/auth/state")
 def auth_state(request: Request):
-    with db.tx() as c:
-        u = auth.user_for_token(c, auth.token_from(request))
-        return {"setup_needed": auth.setup_needed(c), "user": auth.public(u) if u else None,
-                "firm_name": db.get_setting(c, "firm_name", "Your CA Office"),
-                "google": google_auth.configured(), "google_domain": google_auth.allowed_domain()}
+    """Where the person stands: signed out, signed in without a firm, or inside a firm."""
+    s = tenancy.session(auth.token_from(request))
+    out = {"google": google_auth.configured(), "google_domain": google_auth.allowed_domain(),
+           "dev_login": auth.dev_login_enabled(), "signed_in": bool(s), "provider": os.environ.get("CABOT_PROVIDER_NAME", "")}
+    if not s:
+        return out
+    ms = tenancy.memberships(s["email"])
+    out.update(email=s["email"], name=s["name"], firm_id=s["firm_id"], is_platform_admin=tenancy.is_admin(s["email"]),
+               firms=[{"id": m["firm_id"], "name": m["firm_name"], "status": m["status"]} for m in ms],
+               open_signup=os.environ.get("CABOT_OPEN_SIGNUP", "0") == "1")
+    return out
 
 
 @app.get("/api/auth/google/start", include_in_schema=False)
 def google_start(request: Request):
     if not google_auth.configured():
-        raise HTTPException(404, "Google sign-in isn't set up for this office")
-    with db.tx() as c:
-        if auth.setup_needed(c):
-            return RedirectResponse("/?auth_error=" + quote("Set up the office first; Google sign-in works after that."))
-        url, browser = google_auth.start(c, str(request.base_url))
+        raise HTTPException(404, "Google sign-in isn't set up on this server")
+    url, browser = google_auth.start(str(request.base_url))
     r = RedirectResponse(url, status_code=302)
     r.set_cookie(google_auth.STATE_COOKIE, browser, httponly=True, samesite="lax", secure=auth.secure_cookies(),
                  max_age=int(google_auth.STATE_TTL.total_seconds()), path="/api/auth/google")
@@ -120,87 +129,126 @@ def google_callback(request: Request, code: str = "", state: str = "", error: st
     key = f"google:{request.client.host if request.client else '-'}"
     try:
         auth.check_rate(key)
+        ident = google_auth.finish(code, state, request.cookies.get(google_auth.STATE_COOKIE), str(request.base_url))
     except HTTPException as e:
         return fail(e.detail)
-    with db.tx() as c:
-        try:
-            user = google_auth.finish(c, code, state, request.cookies.get(google_auth.STATE_COOKIE), str(request.base_url))
-        except google_auth.GoogleError as e:
-            auth.record_fail(key)
-            return fail(str(e))  # leaving the block normally commits the state deletion
-        db.log(c, user["id"], "login", "user", user["id"], f"{user['name']} signed in with Google")
-        r = RedirectResponse("/#/today", status_code=302)
-        _login_response(c, user["id"], r)
+    except google_auth.GoogleError as e:
+        auth.record_fail(key)
+        return fail(str(e))
+    r = RedirectResponse("/#/today", status_code=302)
+    _set_session_cookie(r, _sign_in(ident["email"], ident["name"], ident["sub"]))
     r.delete_cookie(google_auth.STATE_COOKIE, path="/api/auth/google")
     return r
 
 
-@app.post("/api/auth/setup")
-def auth_setup(body: SetupIn, response: Response):
-    """First run only: create the office and its first partner."""
-    with db.tx() as c:
-        if not auth.setup_needed(c):
-            raise HTTPException(400, "This office is already set up — sign in instead")
-        if not body.accept_terms:
-            raise HTTPException(400, "Please accept the Terms of Use to continue")
-        auth.validate_pw(body.password)
-        if not body.name.strip():
-            raise HTTPException(400, "Your name is required")
-        email = _norm_email(body.email)
-        db.set_setting(c, "firm_name", body.firm_name.strip() or "Your CA Office")
-        # an older install has users without passwords: the first partner becomes this login
-        legacy = db.row(c, "SELECT id FROM users WHERE role='partner' AND pw_hash IS NULL ORDER BY id LIMIT 1")
-        if legacy:
-            c.execute("UPDATE users SET name=?, email=?, pw_hash=?, active=1 WHERE id=?",
-                      (body.name.strip(), email, auth.hash_pw(body.password), legacy["id"]))
-            uid = legacy["id"]
-        else:
-            uid = c.execute("INSERT INTO users(name, role, email, pw_hash, perms, active) VALUES(?,?,?,?,?,1)",
-                            (body.name.strip(), "partner", email, auth.hash_pw(body.password), "[]")).lastrowid
-        db.set_setting(c, "terms_accepted", {"by": uid, "name": body.name.strip(), "email": email, "at": db.now()})
-        db.log(c, uid, "setup", "office", None, f"{body.name.strip()} set up the office and accepted the Terms of Use")
-        return _login_response(c, uid, response)
+class DevLoginIn(BaseModel):
+    email: str
+    name: str = ""
 
 
-@app.post("/api/auth/login")
-def login(body: LoginIn, response: Response, request: Request):
-    key = (body.email or "").strip().lower()
-    auth.check_rate(key)
-    auth.check_rate(f"ip:{request.client.host if request.client else '-'}")
-    with db.tx() as c:
-        u = db.row(c, "SELECT * FROM users WHERE email=? AND active=1", (key,))
-        if not u or not auth.check_pw(body.password, u["pw_hash"]):
-            auth.record_fail(key)
-            auth.record_fail(f"ip:{request.client.host if request.client else '-'}")
-            raise HTTPException(401, "Email or password is wrong")
-        db.log(c, u["id"], "login", "user", u["id"], f"{u['name']} signed in")
-        return _login_response(c, u["id"], response)
+@app.post("/api/auth/dev-login", include_in_schema=False)
+def dev_login(body: DevLoginIn, request: Request, response: Response):
+    """Sign in without Google for local development and demos. Off unless CABOT_DEV_LOGIN=1, localhost only."""
+    host = request.client.host if request.client else ""
+    if not auth.dev_login_enabled() or host not in ("127.0.0.1", "::1", "localhost") or auth.secure_cookies():
+        raise HTTPException(404)
+    email = _norm_email(body.email)
+    token = _sign_in(email, body.name or email.split("@")[0].title(), None)
+    _set_session_cookie(response, token)
+    return {"ok": True, "token": token}
 
 
 @app.post("/api/auth/logout")
 def logout(request: Request, response: Response):
-    with db.tx() as c:
-        auth.end_session(c, auth.token_from(request))
+    tenancy.end_session(auth.token_from(request))
     response.delete_cookie(auth.COOKIE, path="/")
     return {"ok": True}
 
 
-class PasswordIn(BaseModel):
-    current: str
-    new: str
+class EnterIn(BaseModel):
+    firm_id: int
 
 
-@app.post("/api/auth/password")
-def change_password(body: PasswordIn, request: Request, user: dict = Depends(auth.current)):
-    if not auth.check_pw(body.current, user["pw_hash"]):
-        raise HTTPException(400, "Current password is wrong")
-    auth.validate_pw(body.new)
-    with db.tx() as c:
-        c.execute("UPDATE users SET pw_hash=?, must_change_pw=0 WHERE id=?", (auth.hash_pw(body.new), user["id"]))
-        # sign out every other device
-        keep = auth._digest(auth.token_from(request) or "")
-        c.execute("DELETE FROM sessions WHERE user_id=? AND token!=?", (user["id"], keep))
+@app.post("/api/auth/firm")
+async def enter_firm(body: EnterIn, who: dict = Depends(auth.identity)):
+    m = next((m for m in tenancy.memberships(who["email"]) if m["firm_id"] == body.firm_id), None)
+    if not m:
+        raise HTTPException(404, "You're not on this firm's team")
+    if m["status"] != "active":
+        raise HTTPException(403, "This firm is awaiting approval" if m["status"] == "pending" else "This firm is suspended")
+    tenancy.enter_firm(who["_token"], m["firm_id"], m["user_id"])
     return {"ok": True}
+
+
+class NewFirmIn(BaseModel):
+    name: str
+    accept_terms: bool = False
+
+
+@app.post("/api/firms")
+async def create_firm(body: NewFirmIn, who: dict = Depends(auth.identity)):
+    """Any signed-in Google user can start a firm workspace; they become its super admin.
+    Unless CABOT_OPEN_SIGNUP=1 a platform owner must approve it before anyone can use it."""
+    if not body.name.strip():
+        raise HTTPException(400, "Enter your firm's name")
+    if not body.accept_terms:
+        raise HTTPException(400, "Please accept the Terms of Use to continue")
+    if len([m for m in tenancy.memberships(who["email"]) if m["user_id"]]) >= 5 and not who["is_platform_admin"]:
+        raise HTTPException(400, "You already belong to several firms — contact support to add more")
+    open_signup = os.environ.get("CABOT_OPEN_SIGNUP", "0") == "1" or who["is_platform_admin"]
+    f, uid = tenancy.create_firm(body.name, who["email"], who["name"] or who["email"], who["google_sub"],
+                                 "active" if open_signup else "pending")
+    if f["status"] == "active":
+        tenancy.enter_firm(who["_token"], f["id"], uid)
+    return {"firm": f, "pending": f["status"] == "pending"}
+
+
+# ============================================================ platform
+def _platform_admin(who: dict) -> None:
+    if not who["is_platform_admin"]:
+        raise HTTPException(403, "Platform owners only")
+
+
+@app.get("/api/platform/firms")
+async def platform_firms(who: dict = Depends(auth.identity)):
+    """Firms and their status. Deliberately no client data: the platform is not a Data Fiduciary for it."""
+    _platform_admin(who)
+    out = []
+    for f in tenancy.firms():
+        with db.use_firm(f["id"]):
+            with db.tx() as c:
+                f["members"] = db.row(c, "SELECT COUNT(*) n FROM users WHERE active=1")["n"]
+                f["clients"] = db.row(c, "SELECT COUNT(*) n FROM clients WHERE archived=0")["n"]
+        out.append(f)
+    return out
+
+
+class FirmStatusIn(BaseModel):
+    status: str
+
+
+@app.post("/api/platform/firms/{fid}")
+async def platform_firm_status(fid: int, body: FirmStatusIn, who: dict = Depends(auth.identity)):
+    _platform_admin(who)
+    if body.status not in ("active", "suspended"):
+        raise HTTPException(400, "Status must be active or suspended")
+    if not tenancy.firm(fid):
+        raise HTTPException(404)
+    return tenancy.set_status(fid, body.status, who["email"])
+
+
+class InviteFirmIn(BaseModel):
+    name: str
+    owner_email: str
+    owner_name: str = ""
+
+
+@app.post("/api/platform/firms")
+async def platform_invite_firm(body: InviteFirmIn, who: dict = Depends(auth.identity)):
+    """Platform owner sets up a firm for a customer; the named person becomes its super admin on first Google sign-in."""
+    _platform_admin(who)
+    f, _ = tenancy.create_firm(body.name, _norm_email(body.owner_email), body.owner_name, None, "active")
+    return f
 
 
 # ================================================================ meta
@@ -209,19 +257,27 @@ def bootstrap(request: Request, user: dict = Depends(auth.current)):
     with db.tx() as c:
         cur = F.fy_of(engine.today())
         signed = {r["fy"]: r for r in db.rows(c, "SELECT * FROM calendar_signoff")}
+        f = user["_firm"]
         return {
             "me": auth.public(user),
+            "firm": {"id": f["id"], "name": f["name"], "slug": f["slug"]},
+            "my_firms": [{"id": m["firm_id"], "name": m["firm_name"], "status": m["status"]}
+                         for m in tenancy.memberships(user["email"])],
+            "is_platform_admin": tenancy.is_admin(user["email"]),
             "users": [auth.public(u) for u in db.rows(c, "SELECT * FROM users WHERE active=1 ORDER BY id")],
             "perms": auth.PERMS,
+            "levels": {k: {"label": v[0], "perms": auth.level_perms(c)[k], "client_access": v[2]} for k, v in auth.LEVELS.items()},
             "whatsapp": whatsapp.configured(),
+            "whatsapp_platform": whatsapp.platform_configured(),
+            "whatsapp_number": f["wa_phone_number_id"],
             "google": {"enabled": google_auth.configured(), "domain": google_auth.allowed_domain(),
                        "redirect_uri": google_auth.redirect_uri(str(request.base_url))},
             "ocr": {"tesseract": ocr.tesseract_available(), "vision": ocr.vision_enabled()},
-            "firm_name": db.get_setting(c, "firm_name", "Your CA Office"),
+            "firm_name": db.get_setting(c, "firm_name", f["name"]),
             "today": engine.today().isoformat(),
             "tracking_start": db.get_setting(c, "tracking_start", engine.today().isoformat()),
-            "fys": [{"fy": f, "label": F.fy_label(f), "current": f == cur, "signed_off": f in signed}
-                    for f in engine.live_fys()],
+            "fys": [{"fy": fy, "label": F.fy_label(fy), "current": fy == cur, "signed_off": fy in signed}
+                    for fy in engine.live_fys()],
             "doc_types": {k: v["label"] for k, v in DOC_TYPES.items()},
             "entity_types": ENTITY_TYPES, "states": GST_STATES,
             "rules": [{"code": r.code, "name": r.name, "form": r.form, "authority": r.authority} for r in RULES],
@@ -234,6 +290,7 @@ def bootstrap(request: Request, user: dict = Depends(auth.current)):
 class Settings(BaseModel):
     firm_name: str | None = None
     tracking_start: str | None = None
+    wa_phone_number_id: str | None = None
 
 
 @app.post("/api/settings")
@@ -241,57 +298,102 @@ def save_settings(s: Settings, user: dict = Depends(auth.current)):
     auth.require(user, "manage_team")
     with db.tx() as c:
         if s.firm_name is not None:
-            db.set_setting(c, "firm_name", s.firm_name.strip() or "Your CA Office")
+            db.set_setting(c, "firm_name", s.firm_name.strip() or user["_firm"]["name"])
+            with tenancy.tx() as pc:
+                pc.execute("UPDATE firms SET name=? WHERE id=?", (s.firm_name.strip() or user["_firm"]["name"], user["_firm"]["id"]))
         if s.tracking_start:
             date.fromisoformat(s.tracking_start)
             db.set_setting(c, "tracking_start", s.tracking_start)
             # untouched filings follow the new start date; anything someone worked on stays as it is
             c.execute("UPDATE obligations SET status='open' WHERE status='not_tracked' AND due>=?", (s.tracking_start,))
             c.execute("UPDATE obligations SET status='not_tracked' WHERE status='open' AND due<?", (s.tracking_start,))
+        if s.wa_phone_number_id is not None:
+            pid = s.wa_phone_number_id.strip() or None
+            with tenancy.tx() as pc:
+                if pid and db.row(pc, "SELECT id FROM firms WHERE wa_phone_number_id=? AND id!=?", (pid, user["_firm"]["id"])):
+                    raise HTTPException(400, "That WhatsApp number is already connected to another firm")
+                pc.execute("UPDATE firms SET wa_phone_number_id=? WHERE id=?", (pid, user["_firm"]["id"]))
         return {"ok": True}
 
 
+# ================================================================== team
 class NewUser(BaseModel):
     name: str
     email: str
-    role: str = "staff"
-    perms: list[str] | None = None
+    level: str = "staff"
+    client_access: str | None = None
+    client_ids: list[int] = []
+    perms: list[str] | None = None   # None = use the level's permissions
     phone: str | None = None
 
 
 class UserPatch(BaseModel):
-    unlink_google: bool = False
     name: str | None = None
     email: str | None = None
-    role: str | None = None
+    level: str | None = None
+    client_access: str | None = None
+    client_ids: list[int] | None = None
     perms: list[str] | None = None
+    reset_perms: bool = False        # go back to the level's permissions
     active: bool | None = None
     phone: str | None = None
+
+
+def _team_member(c, u: dict) -> dict:
+    out = auth.public(u)
+    out["client_ids"] = [r["client_id"] for r in db.rows(c, "SELECT client_id FROM user_clients WHERE user_id=?", (u["id"],))]
+    out["last_login"] = u.get("last_login")
+    return out
+
+
+def _check_level_change(c, user: dict, target: dict | None, new_level: str) -> None:
+    if new_level not in auth.LEVELS:
+        raise HTTPException(400, "Unknown level")
+    if new_level == "owner" and user["level"] != "owner":
+        raise HTTPException(403, "Only a super admin can make someone a super admin")
+    if target and target["level"] == "owner" and user["level"] != "owner":
+        raise HTTPException(403, "Only a super admin can change another super admin")
+
+
+def _set_clients(c, uid: int, client_ids: list[int]) -> None:
+    valid = {r["id"] for r in db.rows(c, "SELECT id FROM clients")}
+    c.execute("DELETE FROM user_clients WHERE user_id=?", (uid,))
+    for cid in set(client_ids) & valid:
+        c.execute("INSERT INTO user_clients(user_id, client_id) VALUES(?,?)", (uid, cid))
 
 
 @app.get("/api/users")
 def list_users(user: dict = Depends(auth.current)):
     with db.tx() as c:
-        return [auth.public(u) for u in db.rows(c, "SELECT * FROM users ORDER BY active DESC, role='partner' DESC, name")]
+        return [_team_member(c, u) for u in db.rows(c, "SELECT * FROM users ORDER BY active DESC, "
+                                                       "CASE level WHEN 'owner' THEN 0 WHEN 'partner' THEN 1 ELSE 2 END, name")]
 
 
 @app.post("/api/users")
 def add_user(u: NewUser, user: dict = Depends(auth.current)):
-    """Invite a colleague. Returns a one-time password to hand over; they must change it on first sign-in."""
+    """Add a colleague by their Google account email. They sign in with Google; no passwords."""
     auth.require(user, "manage_team")
-    if u.role not in ("staff", "partner") or not u.name.strip():
-        raise HTTPException(400, "Name and a role of staff/partner are required")
+    if not u.name.strip():
+        raise HTTPException(400, "Name is required")
     email = _norm_email(u.email)
-    perms = [p for p in (u.perms if u.perms is not None else auth.STAFF_DEFAULT) if p in auth.PERMS]
-    temp = auth.temp_password()
+    dom = google_auth.allowed_domain()
+    if dom and not email.endswith("@" + dom):
+        raise HTTPException(400, f"Only @{dom} Google accounts can sign in here")
     with db.tx() as c:
+        _check_level_change(c, user, None, u.level)
         if db.row(c, "SELECT id FROM users WHERE email=?", (email,)):
             raise HTTPException(400, "Someone with this email is already on the team")
-        uid = c.execute("INSERT INTO users(name, role, email, pw_hash, perms, active, must_change_pw, phone) "
-                        "VALUES(?,?,?,?,?,1,1,?)", (u.name.strip(), u.role, email, auth.hash_pw(temp), json.dumps(perms),
-                                                    re.sub(r"\D", "", u.phone or "")[-10:] or None)).lastrowid
-        db.log(c, user["id"], "user_add", "user", uid, f"{user['name']} invited {u.name.strip()} ({u.role})")
-        return {"user": auth.public(db.row(c, "SELECT * FROM users WHERE id=?", (uid,))), "temp_password": temp}
+        access = u.client_access or auth.LEVELS[u.level][2]
+        if access not in ("all", "selected"):
+            raise HTTPException(400, "Client access must be all or selected")
+        perms = json.dumps(sorted(p for p in u.perms if p in auth.PERMS)) if u.perms is not None else None
+        uid = c.execute("INSERT INTO users(name, role, email, level, perms, client_access, active, phone) VALUES(?,?,?,?,?,?,1,?)",
+                        (u.name.strip(), auth.role_for(u.level), email, u.level, perms, access,
+                         re.sub(r"\D", "", u.phone or "")[-10:] or None)).lastrowid
+        _set_clients(c, uid, u.client_ids)
+        tenancy.add_membership(email, user["_firm"]["id"], uid)
+        db.log(c, user["id"], "user_add", "user", uid, f"{user['name']} added {u.name.strip()} as {auth.LEVELS[u.level][0]}")
+        return _team_member(c, db.row(c, "SELECT * FROM users WHERE id=?", (uid,)))
 
 
 @app.patch("/api/users/{uid}")
@@ -301,40 +403,57 @@ def edit_user(uid: int, p: UserPatch, user: dict = Depends(auth.current)):
         target = db.row(c, "SELECT * FROM users WHERE id=?", (uid,))
         if not target:
             raise HTTPException(404)
-        new_role = p.role or target["role"]
+        new_level = p.level or target["level"]
+        _check_level_change(c, user, target, new_level)
         new_active = target["active"] if p.active is None else int(p.active)
-        if new_role not in ("staff", "partner"):
-            raise HTTPException(400, "Role must be staff or partner")
-        if target["role"] == "partner" and (new_role != "partner" or not new_active):
-            others = db.row(c, "SELECT COUNT(*) n FROM users WHERE role='partner' AND active=1 AND id!=?", (uid,))["n"]
+        if target["level"] == "owner" and (new_level != "owner" or not new_active):
+            others = db.row(c, "SELECT COUNT(*) n FROM users WHERE level='owner' AND active=1 AND id!=?", (uid,))["n"]
             if not others:
-                raise HTTPException(400, "The office needs at least one active partner")
-        perms = json.dumps([x for x in p.perms if x in auth.PERMS]) if p.perms is not None else target["perms"]
-        email = _norm_email(p.email) if p.email is not None else None
-        if email and db.row(c, "SELECT id FROM users WHERE email=? AND id!=?", (email, uid)):
-            raise HTTPException(400, "Someone else already uses this email")
-        c.execute("UPDATE users SET name=COALESCE(?,name), email=COALESCE(?,email), role=?, perms=?, active=?, "
-                  "phone=COALESCE(?,phone) WHERE id=?", (p.name, email, new_role, perms, new_active, p.phone, uid))
-        if p.unlink_google:
+                raise HTTPException(400, "The firm needs at least one active super admin")
+        if uid == user["id"] and (not new_active or (target["level"] == "owner" and new_level != "owner")):
+            raise HTTPException(400, "You can't remove your own access — ask another super admin")
+        access = p.client_access or target["client_access"] or "all"
+        if access not in ("all", "selected"):
+            raise HTTPException(400, "Client access must be all or selected")
+        perms = target["perms"]
+        if p.reset_perms or new_level == "owner":
+            perms = None
+        elif p.perms is not None:
+            perms = json.dumps(sorted(x for x in p.perms if x in auth.PERMS))
+        email = _norm_email(p.email) if p.email else target["email"]
+        if email != target["email"]:
+            if db.row(c, "SELECT id FROM users WHERE email=? AND id!=?", (email, uid)):
+                raise HTTPException(400, "Someone else already uses this email")
+            tenancy.change_membership_email(target["email"], email, user["_firm"]["id"])
             c.execute("UPDATE users SET google_sub=NULL WHERE id=?", (uid,))
+        c.execute("UPDATE users SET name=COALESCE(?,name), email=?, level=?, role=?, perms=?, client_access=?, active=?, "
+                  "phone=COALESCE(?,phone) WHERE id=?", (p.name, email, new_level, auth.role_for(new_level), perms, access,
+                                                         new_active, p.phone, uid))
+        if p.client_ids is not None:
+            _set_clients(c, uid, p.client_ids)
         if not new_active:
-            c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+            tenancy.end_user_sessions(user["_firm"]["id"], uid)
         db.log(c, user["id"], "user_edit", "user", uid, f"{user['name']} updated {target['name']}'s access")
-        return auth.public(db.row(c, "SELECT * FROM users WHERE id=?", (uid,)))
+        return _team_member(c, db.row(c, "SELECT * FROM users WHERE id=?", (uid,)))
 
 
-@app.post("/api/users/{uid}/reset")
-def reset_password(uid: int, user: dict = Depends(auth.current)):
+class LevelsIn(BaseModel):
+    levels: dict[str, list[str]]
+
+
+@app.post("/api/levels")
+def save_levels(body: LevelsIn, user: dict = Depends(auth.current)):
+    """Tune what each level can do in this firm. The super-admin level always has everything."""
     auth.require(user, "manage_team")
-    temp = auth.temp_password()
     with db.tx() as c:
-        t = db.row(c, "SELECT * FROM users WHERE id=?", (uid,))
-        if not t:
-            raise HTTPException(404)
-        c.execute("UPDATE users SET pw_hash=?, must_change_pw=1 WHERE id=?", (auth.hash_pw(temp), uid))
-        c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
-        db.log(c, user["id"], "user_reset", "user", uid, f"{user['name']} reset {t['name']}'s password")
-    return {"temp_password": temp}
+        cur = auth.level_perms(c)
+        for k, perms in body.levels.items():
+            if k in auth.LEVELS and k != "owner":
+                cur[k] = sorted(p for p in perms if p in auth.PERMS)
+        cur.pop("owner", None)
+        db.set_setting(c, "levels", cur)
+        db.log(c, user["id"], "levels", "office", None, f"{user['name']} changed what each level can do")
+        return auth.level_perms(c)
 
 
 # =========================================================== dashboard
@@ -416,6 +535,7 @@ class Action(BaseModel):
 
 @app.post("/api/obligations/{oid}/action")
 def obligation_action(oid: int, a: Action, user: dict = Depends(auth.current)):
+    auth.require(user, "work")
     with db.tx() as c:
         _obligation_for(c, oid, user)
         return engine.transition(c, oid, a.action, user, a.ack_no, a.filed_on, a.note)
@@ -427,6 +547,7 @@ class Assign(BaseModel):
 
 @app.post("/api/obligations/{oid}/assign")
 def obligation_assign(oid: int, a: Assign, user: dict = Depends(auth.current)):
+    auth.require(user, "work")
     with db.tx() as c:
         o = _obligation_for(c, oid, user)
         if a.assignee_id and not db.row(c, "SELECT id FROM users WHERE id=? AND active=1", (a.assignee_id,)):
@@ -595,7 +716,7 @@ def _create_client(c, ci: ClientIn, user: dict) -> dict:
     d = _clean_client(ci)
     if d["pan"] and db.row(c, "SELECT id FROM clients WHERE pan=?", (d["pan"],)):
         raise HTTPException(400, f"A client with PAN {d['pan']} already exists")
-    if not auth.can(user, "all_clients") and not d["assignee_id"]:
+    if auth.visible_client_ids(c, user) is not None and not d["assignee_id"]:
         d["assignee_id"] = user["id"]  # otherwise the person who added it couldn't see it
     cols = list(d.keys()) + ["created_at"]
     cur = c.execute(f"INSERT INTO clients({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
@@ -752,6 +873,7 @@ async def upload(files: list[UploadFile] = File(...), client_id: int | None = Fo
                  user: dict = Depends(auth.current)):
     """Accepts any mix of files and zips (nested, Windows-made, WhatsApp exports). Zips are read entry by entry
     from the spooled upload, never fully into memory."""
+    auth.require(user, "work")
     batch = uuid.uuid4().hex[:10]
     results: list[dict] = []
     total = 0
@@ -840,6 +962,7 @@ class Confirm(BaseModel):
 
 @app.post("/api/documents/{did}/confirm")
 def confirm(did: int, body: Confirm, user: dict = Depends(auth.current)):
+    auth.require(user, "work")
     with db.tx() as c:
         _doc_for(c, did, user)
         auth.require_client(c, user, body.client_id)
@@ -849,6 +972,7 @@ def confirm(did: int, body: Confirm, user: dict = Depends(auth.current)):
 
 @app.post("/api/documents/{did}/reject")
 def reject(did: int, user: dict = Depends(auth.current)):
+    auth.require(user, "work")
     with db.tx() as c:
         _doc_for(c, did, user)
         c.execute("UPDATE documents SET status='rejected' WHERE id=?", (did,))
@@ -858,6 +982,7 @@ def reject(did: int, user: dict = Depends(auth.current)):
 
 @app.get("/api/documents/{did}/file")
 def download(did: int, user: dict = Depends(auth.current)):
+    auth.require(user, "view_documents")
     with db.tx() as c:
         d = _doc_for(c, did, user)
     if not d["stored_path"] or not Path(d["stored_path"]).exists():
@@ -873,7 +998,7 @@ def download(did: int, user: dict = Depends(auth.current)):
 
 
 def _zip_response(c, client_ids: list[int], name: str, user: dict) -> FileResponse:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip", dir=db.DATA_DIR)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip", dir=db.firm_dir())
     with tmp:
         n = archive.export_clients(c, client_ids, tmp)
     db.log(c, user["id"], "export", "client", client_ids[0] if len(client_ids) == 1 else None,
@@ -908,6 +1033,7 @@ def export_all(user: dict = Depends(auth.current)):
 # ============================================================== outbox
 @app.post("/api/clients/{cid}/chase")
 def chase(cid: int, user: dict = Depends(auth.current)):
+    auth.require(user, "work")
     with db.tx() as c:
         auth.require_client(c, user, cid)
         _consent_ok(c, cid)
@@ -1054,11 +1180,13 @@ def execute(p: Proposal, user: dict = Depends(auth.current)):
                 return {"ok": True, "message": "Due date updated across all affected clients."}
             return {"ok": True, "message": "Sent to a partner for approval."}
         if p.kind == "transition":
+            auth.require(user, "work")
             pl = p.payload
             _obligation_for(c, int(pl["obligation_id"]), user)
             e = engine.transition(c, int(pl["obligation_id"]), pl["action"], user, pl.get("ack_no"), None, pl.get("note"))
             return {"ok": True, "message": f"{e['form']} {e['period_label']} is now {e['stage'].replace('_', ' ')}."}
         if p.kind == "chase":
+            auth.require(user, "work")
             cid = int(p.payload["client_id"])
             auth.require_client(c, user, cid)
             _consent_ok(c, cid)
@@ -1095,15 +1223,37 @@ def load_demo(user: dict = Depends(auth.current)):
 
 # ============================================================== privacy
 @app.get("/api/public/info")
-def public_info(request: Request):
-    """Everything the public privacy policy and terms pages show. No login needed, no personal data."""
-    with db.tx() as c:
+def public_info(request: Request, firm: str | None = None):
+    """What the public privacy policy and terms pages show. No login needed, no client data.
+
+    With ?firm=<slug>: that firm's own privacy notice (it is the Data Fiduciary for its clients).
+    Without: the platform's notice for the people who sign in (name, email, Google sign-in)."""
+    env = os.environ.get
+    provider = env("CABOT_PROVIDER_NAME", "the provider of this software")
+    platform_info = {
+        "scope": "platform", "firm_name": provider, "provider_name": provider,
+        "officer_name": env("CABOT_PROVIDER_CONTACT_NAME", ""), "officer_email": env("CABOT_PROVIDER_CONTACT_EMAIL", ""),
+        "officer_phone": env("CABOT_PROVIDER_CONTACT_PHONE", ""), "firm_address": env("CABOT_PROVIDER_ADDRESS", ""),
+        "jurisdiction": env("CABOT_JURISDICTION", ""), "policy_updated": env("CABOT_POLICY_UPDATED", ""),
+        "retention_years": 1, "response_days": 30, "encrypted": storage.enabled(),
+        "purposes": ["Signing you in and keeping your account secure", "Letting your firm manage who can access its workspace",
+                     "Running, securing and supporting the service"],
+        "shared_with": ["Google LLC — Sign in with Google (your name and email)"] if google_auth.configured() else [],
+    }
+    f = None
+    if firm:
+        with tenancy.tx() as pc:
+            f = db.row(pc, "SELECT * FROM firms WHERE slug=? AND status='active'", (firm,))
+    if not f:
+        return platform_info
+    with db.use_firm(f["id"]), db.tx() as c:
         s = privacy.settings(c)
         return {
+            "scope": "firm", "slug": f["slug"],
             "firm_name": db.get_setting(c, "firm_name", "Your CA Office"),
             "officer_name": s["officer_name"], "officer_email": s["officer_email"], "officer_phone": s["officer_phone"],
             "firm_address": s["firm_address"], "retention_years": s["retention_years"], "response_days": s["response_days"],
-            "jurisdiction": s["jurisdiction"], "policy_updated": s["policy_updated"],
+            "jurisdiction": env("CABOT_JURISDICTION", "") or s["jurisdiction"], "policy_updated": s["policy_updated"],
             "provider_name": os.environ.get("CABOT_PROVIDER_NAME", "the provider of this software"),
             "shared_with": privacy.shared_with(c), "encrypted": storage.enabled(),
             "purposes": privacy.PURPOSES,
@@ -1121,8 +1271,7 @@ def terms_page():
 
 
 def _privacy_admin(user: dict) -> None:
-    if not (auth.can(user, "manage_team") or auth.can(user, "approve")):
-        raise HTTPException(403, "Only partners or team admins can manage data protection")
+    auth.require(user, "privacy")
 
 
 class PrivacySettingsIn(BaseModel):
@@ -1139,7 +1288,7 @@ class PrivacySettingsIn(BaseModel):
 
 @app.post("/api/privacy/settings")
 def privacy_settings(body: PrivacySettingsIn, user: dict = Depends(auth.current)):
-    auth.require(user, "manage_team")
+    auth.require(user, "privacy")
     with db.tx() as c:
         out = privacy.save_settings(c, body.model_dump())
         db.log(c, user["id"], "privacy_settings", "privacy", None, f"{user['name']} updated the privacy settings")
@@ -1237,6 +1386,7 @@ def client_consent(cid: int, body: ConsentIn, user: dict = Depends(auth.current)
 
 @app.post("/api/clients/{cid}/privacy-notice")
 def client_notice(cid: int, request: Request, user: dict = Depends(auth.current)):
+    auth.require(user, "work")
     with db.tx() as c:
         auth.require_client(c, user, cid)
         cl = db.row(c, "SELECT * FROM clients WHERE id=?", (cid,))
@@ -1254,7 +1404,7 @@ class EraseIn(BaseModel):
 
 @app.post("/api/clients/{cid}/erase")
 def erase(cid: int, body: EraseIn, user: dict = Depends(auth.current)):
-    auth.require(user, "manage_team")
+    auth.require(user, "privacy")
     with db.tx() as c:
         cl = db.row(c, "SELECT name FROM clients WHERE id=?", (cid,))
         if not cl:
@@ -1270,7 +1420,7 @@ class PurgeIn(BaseModel):
 
 @app.post("/api/privacy/retention/purge")
 def retention_purge(body: PurgeIn, user: dict = Depends(auth.current)):
-    auth.require(user, "manage_team")
+    auth.require(user, "privacy")
     with db.tx() as c:
         return {"erased": privacy.purge(c, body.ids, user, engine.today())}
 

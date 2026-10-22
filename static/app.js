@@ -37,7 +37,7 @@ async function api(method, path, body, isForm) {
   if (body && !isForm) headers["Content-Type"] = "application/json";
   const res = await fetch(path, { method, headers, credentials: "same-origin", body: isForm ? body : body ? JSON.stringify(body) : undefined });
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401 && !path.startsWith("/api/auth/")) { showAuth(); throw new Error("Please sign in"); }
+  if ((res.status === 401 || res.status === 409) && !path.startsWith("/api/auth/")) { showAuth(); throw new Error("Please sign in"); }
   if (!res.ok) {
     const d = data.detail;
     throw new Error(typeof d === "string" ? d : Array.isArray(d) ? d.map(x => x.msg).join("; ") : `Error ${res.status}`);
@@ -76,7 +76,7 @@ const NAV = [
   ["today", "◎", "Today"], ["inbox", "⇪", "Inbox"], ["calendar", "▦", "Calendar"],
   ["clients", "◫", "Clients"], ["outbox", "✉", "Outbox"], ["privacy", "⛨", "Privacy"], ["settings", "⚙", "Settings"],
 ];
-const privacyAdmin = () => can("manage_team") || can("approve");
+const privacyAdmin = () => can("privacy");
 function renderNav() {
   const route = location.hash.slice(2).split("/")[0] || "today";
   const badge = { inbox: S.counts.inbox, outbox: (S.counts.outbox || 0) + (S.counts.replies || 0), calendar: S.counts.overrides };
@@ -87,11 +87,11 @@ function renderNav() {
   fill($("#side-foot"),
     h("div", { class: "who" }, h("span", { class: "avatar" }, initials(S.me.name)),
       h("div", { class: "grow", style: "min-width:0" }, h("div", { class: "ellipsis", style: "font-weight:600" }, S.me.name),
-        h("div", { class: "small muted" }, S.me.role === "partner" ? "Partner" : "Staff"))),
+        h("div", { class: "small muted" }, S.me.level_label))),
     h("div", { class: "row", style: "margin-top:8px" },
-      h("button", { class: "btn sm ghost", onclick: () => changePassword() }, "Password"),
+      S.boot.my_firms.length > 1 || S.boot.is_platform_admin ? h("button", { class: "btn sm ghost", onclick: () => showAuth(true) }, S.boot.my_firms.length > 1 ? "Switch firm" : "Platform") : null,
       h("button", { class: "btn sm ghost right", onclick: () => safely(async () => { await api("POST", "/api/auth/logout"); S.me = null; showAuth(); }) }, "Sign out")),
-    h("div", { class: "small muted", style: "margin-top:8px" }, h("a", { href: "/privacy", target: "_blank" }, "Privacy"), " · ", h("a", { href: "/terms", target: "_blank" }, "Terms")));
+    h("div", { class: "small muted", style: "margin-top:8px" }, h("a", { href: `/privacy?firm=${S.boot.firm.slug}`, target: "_blank" }, "Privacy"), " · ", h("a", { href: "/terms", target: "_blank" }, "Terms")));
   const cur = S.boot.fys.find(f => f.current);
   fill($("#fy-chip"), h("a", { href: "#/calendar", class: "pill " + (cur.signed_off ? "approved" : "awaiting_docs") },
     cur.label, " · ", cur.signed_off ? "calendar signed off ✓" : "calendar needs partner sign-off"));
@@ -169,7 +169,7 @@ function obligationRow(o, after, opts = {}) {
   const wrap = h("div", { class: "item" });
   const days = o.days_left, r = rel(days);
   const done = ["filed", "na"].includes(o.status);
-  const mine = o.next_action && (o.next_action.role !== "partner" || can("approve"));
+  const mine = o.next_action && (o.next_action.role === "partner" ? can("approve") : can("work"));
   const primary = o.next_action && !done
     ? h("button", { class: "btn sm " + (mine ? "primary" : ""), disabled: !mine || null, title: mine ? "" : "Needs a partner",
         onclick: e => { e.stopPropagation(); act(o, o.next_action.key, after); } }, o.next_action.label)
@@ -275,7 +275,7 @@ async function viewToday(page) {
       h("div", { class: "grow" }, h("h1", {}, `${greet()}, ${firstName(S.me.name)}.`),
         h("div", { class: "muted" }, mineFirst ? `${mineFirst} item${mineFirst === 1 ? " is" : "s are"} waiting on you. ` : "Nothing is waiting on you right now. ",
           c.inbox ? `${c.inbox} file${c.inbox === 1 ? "" : "s"} need a quick look in the Inbox.` : "", d.filed_this_month ? ` ${d.filed_this_month} filed this month.` : "")),
-      h("button", { class: "btn", onclick: () => $("#file-input").click() }, "⇪ Drop files"),
+      can("work") ? h("button", { class: "btn", onclick: () => $("#file-input").click() }, "⇪ Drop files") : null,
       h("a", { class: "btn primary", href: "#/clients/new" }, "+ Client")),
     h("div", { class: "stats" }, stats.map(([k, col, n, label]) =>
       h("button", { class: `stat ${col} ${filter === k ? "on" : ""}`, onclick: () => { store.set("todayFilter", filter === k ? null : k); rerender(); } },
@@ -384,7 +384,8 @@ async function viewInbox(page) {
     const reading = ["pending", "running"].includes(d.ocr_status);
     const row = h("div", { class: "rv" + (reading ? " reading" : "") },
       h("div", {},
-        h("a", { href: `/api/documents/${d.id}/file`, target: "_blank", class: "t1 ellipsis", style: "display:block;font-weight:600" }, d.filename.split("/").pop()),
+        can("view_documents") ? h("a", { href: `/api/documents/${d.id}/file`, target: "_blank", class: "t1 ellipsis", style: "display:block;font-weight:600" }, d.filename.split("/").pop())
+          : h("span", { class: "t1 ellipsis", style: "display:block;font-weight:600" }, d.filename.split("/").pop()),
         h("div", { class: "small muted ellipsis" }, d.reasons.filter(r => /No |Could not|Partial|please|Assumed|Wide/.test(r)).join(" · ") || d.reasons.join(" · ")),
         reading ? h("div", { class: "small", style: "color:var(--brand)" }, "🔎 Reading the scan…") : h("div", { class: "conf" }, h("i", { style: `width:${Math.round(d.confidence * 100)}%` })),
         d.source === "whatsapp" ? h("span", { class: "pill auth", style: "margin-top:4px" }, "via WhatsApp") : null),
@@ -662,8 +663,8 @@ async function viewClient(page, id) {
         h("div", { class: "muted small" }, [S.boot.entity_types[c.entity_type], c.pan, c.gstin, c.gst_scheme !== "none" ? `GST ${c.gst_scheme}` : null,
           c.gst_state ? S.boot.states[c.gst_state] : null, ...FLAGS.filter(([k]) => c[k]).map(x => x[1])].filter(Boolean).join(" · "))),
       up,
-      h("button", { class: "btn", onclick: () => up.click() }, "⇪ Add files"),
-      h("button", { class: "btn", onclick: () => openChase(c.id, reload) }, "✉ Ask for documents"),
+      can("work") ? h("button", { class: "btn", onclick: () => up.click() }, "⇪ Add files") : null,
+      can("work") ? h("button", { class: "btn", onclick: () => openChase(c.id, reload) }, "✉ Ask for documents") : null,
       can("export") ? h("a", { class: "btn", href: `/api/clients/${c.id}/export`, title: "All files, sorted by FY and document type, with an index and the filing register" }, "⇩ Download zip") : null,
       can("manage_clients") ? h("button", { class: "btn", onclick: () => clientForm(c, reload) }, "Edit") : null),
     h("div", { class: "tabs" }, tabs.map(([k, l]) => h("button", { class: tab === k ? "on" : "", onclick: () => { store.set("clientTab", k); reload(); } }, l))),
@@ -672,7 +673,7 @@ async function viewClient(page, id) {
 
 function showDocs(label, docs) {
   drawer(label, h("div", { class: "card list" }, docs.map(dc => h("div", { class: "item", style: "grid-template-columns:1fr auto" },
-    h("div", {}, h("a", { href: `/api/documents/${dc.id}/file`, target: "_blank", class: "t1" }, dc.filename.split("/").pop()),
+    h("div", {}, can("view_documents") ? h("a", { href: `/api/documents/${dc.id}/file`, target: "_blank", class: "t1" }, dc.filename.split("/").pop()) : h("span", { class: "t1" }, dc.filename.split("/").pop()),
       h("div", { class: "t2" }, dc.period_label || "", " · ", dc.status === "confirmed" ? "checked by a person" : `auto-filed (${Math.round(dc.confidence * 100)}%)`)),
     h("span", { class: "small muted" }, `${Math.max(1, Math.round(dc.size / 1024))} KB`)))));
 }
@@ -708,30 +709,27 @@ async function viewSettings(page) {
   const firm = h("input", { class: "input", value: S.boot.firm_name, disabled: !admin || null });
   const start = h("input", { class: "input", type: "date", value: S.boot.tracking_start, disabled: !admin || null });
   const hook = `${location.origin}/api/whatsapp/webhook`;
+  const waNum = h("input", { class: "input", value: S.boot.whatsapp_number || "", placeholder: S.boot.whatsapp_platform ? "e.g. 123456789012345" : "WhatsApp isn't enabled on this platform", disabled: !admin || !S.boot.whatsapp_platform || null });
   const yes = (ok, a, b) => h("div", { class: "small", style: "padding:3px 0" }, ok ? "✓ " : "○ ", ok ? a : b);
   fill(page, h("h1", {}, "Settings"),
     h("div", { class: "grid2", style: "margin-top:16px;align-items:start" },
       h("div", { class: "card pad" }, h("h2", {}, "Office"),
         h("label", { class: "field" }, "Firm name (used in client messages)", firm),
         h("label", { class: "field", style: "margin-top:10px" }, "Track filings due from (older ones are treated as already handled)", start),
-        admin ? h("button", { class: "btn primary", style: "margin-top:10px", onclick: () => safely(async () => { await api("POST", "/api/settings", { firm_name: firm.value, tracking_start: start.value || null }); toast("Saved"); boot(); }) }, "Save")
+        h("label", { class: "field", style: "margin-top:10px" }, "WhatsApp Business number (Meta phone number ID)", waNum),
+        admin ? h("button", { class: "btn primary", style: "margin-top:10px", onclick: () => safely(async () => { await api("POST", "/api/settings", { firm_name: firm.value, tracking_start: start.value || null, wa_phone_number_id: waNum.value }); toast("Saved"); boot(); }) }, "Save")
           : h("div", { class: "small muted", style: "margin-top:8px" }, "Only people who manage the team can change these.")),
       h("div", { class: "card pad" }, h("h2", {}, "Connections"),
         yes(S.boot.llm, "AI command bar connected (Claude). Every change it suggests still needs a click.", "AI command bar: built-in rules only. Set ANTHROPIC_API_KEY for free-form questions."),
         yes(S.boot.ocr.tesseract, "Scanned documents are read on this server (Tesseract).", "Tesseract not installed — scans are sorted by file name only."),
         yes(S.boot.ocr.vision, "Hard-to-read scans fall back to Claude vision (sends the file to Anthropic).", "Claude vision OCR off (set CABOT_VISION_OCR=1 to enable)."),
         yes(S.boot.whatsapp, "WhatsApp Business connected — replies and attachments flow in automatically.", "WhatsApp Business not connected — use “Open WhatsApp” links."),
-        yes(S.boot.google.enabled, `Google sign-in on${S.boot.google.domain ? ` (only @${S.boot.google.domain})` : ""} — invited team members can use their Google account.`,
-          "Google sign-in off (set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)."),
+        yes(S.boot.google.enabled, `Sign in with Google${S.boot.google.domain ? ` (only @${S.boot.google.domain})` : ""} — the only way into the firm.`,
+          "Google sign-in isn't configured on this server."),
         h("div", { class: "small muted", style: "margin-top:6px" }, "Google OAuth redirect URI: ", h("code", {}, S.boot.google.redirect_uri)),
         h("div", { class: "small muted", style: "margin-top:6px" }, "WhatsApp webhook URL for Meta: ", h("code", {}, hook)))),
-    h("div", { class: "group", style: "margin-top:22px" },
-      h("div", { class: "row" }, h("h3", { class: "grow" }, "Team & permissions"),
-        admin ? h("button", { class: "btn sm primary", onclick: inviteUser }, "+ Invite") : null),
-      h("div", { class: "card", style: "overflow:auto;margin-top:8px" }, h("table", { class: "table" },
-        h("tr", {}, h("th", {}, "Person"), h("th", {}, "Role"), Object.keys(S.boot.perms).map(k => h("th", { class: "hide-sm", title: S.boot.perms[k], style: "text-align:center" }, PERM_SHORT[k])), h("th", {}, "")),
-        users.map(u => teamRow(u, admin)))),
-      h("div", { class: "small muted", style: "margin-top:6px" }, "Partners always have every permission. Hover a column for details.")),
+    teamSection(users, admin),
+    admin ? levelsSection() : null,
     h("div", { class: "group" }, h("h3", { style: "margin-bottom:8px" }, "Compliance rules in the calendar"),
       h("div", { class: "card", style: "overflow:auto" }, h("table", { class: "table" },
         h("tr", {}, h("th", {}, "Compliance"), h("th", {}, "Authority"), h("th", { class: "hide-sm" }, "Notes")),
@@ -740,74 +738,97 @@ async function viewSettings(page) {
       h("div", { class: "card pad" }, act.slice(0, 40).map(a => h("div", { class: "small", style: "padding:4px 0;border-bottom:1px solid var(--line)" }, h("span", { class: "muted" }, a.at.replace("T", " ").slice(0, 16), " · "), a.text)))));
 }
 
-const PERM_SHORT = { approve: "Approve", manage_clients: "Clients", send_messages: "Message", all_clients: "All clients", export: "Export", manage_team: "Team" };
+const PERM_SHORT = { view_documents: "Documents", work: "Work", approve: "Approve", manage_clients: "Clients", send_messages: "Message", export: "Export", privacy: "Privacy", manage_team: "Team" };
+const LEVEL_KEYS = () => Object.keys(S.boot.levels);
 
-function teamRow(u, admin) {
-  const isPartner = u.role === "partner";
-  const save = patch => safely(async () => { await api("PATCH", `/api/users/${u.id}`, patch); toast("Access updated"); await boot(); });
-  return h("tr", { style: u.active ? "" : "opacity:.5" },
-    h("td", {}, h("div", { class: "who" }, h("span", { class: "avatar" }, initials(u.name)), h("div", {}, h("b", {}, u.name,
-      u.google_linked ? h("span", { class: "pill auth", style: "margin-left:6px;font-size:11px", title: "Signs in with Google" }, "Google") : null), u.email ? h("div", { class: "small muted" }, u.email)
-      : admin ? h("a", { href: "#", class: "small", onclick: async e => { e.preventDefault();
-          const v = await ask(`Sign-in email for ${u.name}`, [{ name: "email", label: "Email", type: "email", required: true }], "Save");
-          if (v) save({ email: v.email }); } }, "Add sign-in email") : h("div", { class: "small muted" }, "no login yet")))),
-    h("td", {}, admin && u.id !== S.me.id ? h("select", { class: "input", style: "width:auto", onchange: e => save({ role: e.target.value }) },
-      ["staff", "partner"].map(r => h("option", { value: r, selected: r === u.role }, r === "partner" ? "Partner" : "Staff"))) : (isPartner ? "Partner" : "Staff")),
-    Object.keys(S.boot.perms).map(k => h("td", { class: "hide-sm", style: "text-align:center" },
-      h("input", { type: "checkbox", checked: u.perms.includes(k), disabled: !admin || isPartner || null, title: S.boot.perms[k],
-        onchange: e => save({ perms: e.target.checked ? [...u.perms, k] : u.perms.filter(x => x !== k) }) }))),
-    h("td", {}, admin && u.id !== S.me.id ? h("div", { class: "row" },
-      h("button", { class: "btn sm ghost", onclick: () => safely(async () => {
-        if (!confirm(`Reset ${u.name}'s password? They'll be signed out everywhere.`)) return;
-        const r = await api("POST", `/api/users/${u.id}/reset`); showTempPassword(u.name, u.email, r.temp_password);
-      }) }, "Reset password"),
-      u.google_linked ? h("button", { class: "btn sm ghost", title: "They'll need to sign in with Google again (or use a password) to re-link", onclick: () => save({ unlink_google: true }) }, "Unlink Google") : null,
-      h("button", { class: "btn sm ghost" + (u.active ? " danger" : ""), onclick: () => save({ active: !u.active }) }, u.active ? "Deactivate" : "Reactivate")) : null));
+function teamSection(users, admin) {
+  return h("div", { class: "group", style: "margin-top:22px" },
+    h("div", { class: "row" }, h("h3", { class: "grow" }, "Team & access"),
+      admin ? h("button", { class: "btn sm primary", onclick: () => memberDrawer(null) }, "+ Add team member") : null),
+    h("div", { class: "small muted", style: "margin:4px 0 8px" }, "People sign in with their Google account. Each person's level decides what they can do; client access decides which client accounts they see."),
+    h("div", { class: "card", style: "overflow:auto" }, h("table", { class: "table" },
+      h("tr", {}, h("th", {}, "Person"), h("th", {}, "Level"), h("th", {}, "Client accounts"), h("th", { class: "hide-sm" }, "Can"), h("th", {}, "")),
+      users.map(u => h("tr", { style: u.active ? "" : "opacity:.5" },
+        h("td", {}, h("div", { class: "who" }, h("span", { class: "avatar" }, initials(u.name)),
+          h("div", {}, h("b", {}, u.name), h("div", { class: "small muted" }, u.email, u.last_login ? ` · last in ${u.last_login.slice(0, 10)}` : " · hasn't signed in yet")))),
+        h("td", {}, h("span", { class: "pill " + (u.level === "owner" ? "review" : "auth") }, u.level_label)),
+        h("td", { class: "small" }, u.level === "owner" || u.client_access === "all" ? "All clients" : `${u.client_ids.length} selected + assigned`),
+        h("td", { class: "hide-sm small muted" }, u.perms.length ? u.perms.map(p => PERM_SHORT[p]).join(" · ") : "View only", u.custom_perms ? h("span", { class: "pill awaiting_docs", style: "margin-left:6px;font-size:11px" }, "custom") : null),
+        h("td", {}, admin && (u.level !== "owner" || S.me.level === "owner") ? h("button", { class: "btn sm", onclick: () => memberDrawer(u) }, "Edit") : null))))));
 }
 
-function showTempPassword(name, email, pw) {
-  drawer(`Sign-in for ${name}`, [
-    h("div", { class: "hint" }, "Share this once, in person or on a call. It won't be shown again; they'll set their own password on first sign-in."),
-    h("div", { class: "card pad" }, h("div", { class: "small muted" }, "Email"), h("b", {}, email), h("div", { class: "small muted", style: "margin-top:8px" }, "Temporary password"),
-      h("div", { style: "font:600 22px ui-monospace,monospace;letter-spacing:.04em" }, pw)),
-    h("button", { class: "btn", onclick: () => navigator.clipboard.writeText(`${location.origin}\nEmail: ${email}\nPassword: ${pw}`).then(() => toast("Copied")) }, "Copy sign-in details")]);
-}
-
-function inviteUser() {
-  const name = h("input", { class: "input", placeholder: "Priya Shah" });
-  const email = h("input", { class: "input", type: "email", placeholder: "priya@yourfirm.in" });
-  const role = h("select", { class: "input" }, h("option", { value: "staff" }, "Staff"), h("option", { value: "partner" }, "Partner"));
-  const DEFAULT = ["manage_clients", "send_messages", "all_clients", "export"];
-  const boxes = Object.entries(S.boot.perms).map(([k, label]) => {
-    const cb = h("input", { type: "checkbox", checked: DEFAULT.includes(k), value: k });
-    return h("label", { class: "toggle" + (DEFAULT.includes(k) ? " on" : "") }, cb, label);
+async function memberDrawer(u) {
+  const clients = await api("GET", "/api/clients");
+  const isNew = !u;
+  u = u || { name: "", email: "", level: "staff", client_access: S.boot.levels.staff.client_access, client_ids: [], perms: S.boot.levels.staff.perms, custom_perms: false, active: 1 };
+  const name = h("input", { class: "input", value: u.name, placeholder: "Priya Shah" });
+  const email = h("input", { class: "input", type: "email", value: u.email, placeholder: S.boot.google.domain ? `priya@${S.boot.google.domain}` : "their Google account email" });
+  const levelOpts = LEVEL_KEYS().filter(k => k !== "owner" || S.me.level === "owner");
+  const level = h("select", { class: "input" }, levelOpts.map(k => h("option", { value: k, selected: k === u.level }, S.boot.levels[k].label)));
+  let access = u.client_access || "all";
+  const accessSeg = h("div", { class: "seg" });
+  const picked = new Set(u.client_ids || []);
+  const q = h("input", { class: "input", placeholder: "Search clients" });
+  const list = h("div", { style: "display:grid;gap:4px;max-height:220px;overflow:auto;border:1px solid var(--line);border-radius:9px;padding:8px" });
+  const drawList = () => fill(list, clients.filter(c => !q.value || c.name.toLowerCase().includes(q.value.toLowerCase())).map(c => {
+    const cb = h("input", { type: "checkbox", checked: picked.has(c.id), onchange: e => e.target.checked ? picked.add(c.id) : picked.delete(c.id) });
+    return h("label", { class: "row small" }, cb, c.name, h("span", { class: "muted" }, c.pan || ""));
+  }));
+  q.addEventListener("input", drawList);
+  const pickWrap = h("div", { style: "display:grid;gap:6px" }, h("div", { class: "small muted" }, "Plus any client or filing assigned to them."), q, list);
+  const drawAccess = () => {
+    fill(accessSeg, ...[["all", "All clients"], ["selected", "Selected clients"]].map(([k, l]) => h("button", { class: access === k ? "on" : "", onclick: e => { e.preventDefault(); access = k; drawAccess(); } }, l)));
+    pickWrap.classList.toggle("hidden", access !== "selected" || level.value === "owner");
+    accessSeg.classList.toggle("hidden", level.value === "owner");
+  };
+  let custom = !!u.custom_perms;
+  const permBoxes = Object.entries(S.boot.perms).map(([k, label]) => { const cb = h("input", { type: "checkbox", value: k }); return [cb, h("label", { class: "toggle" }, cb, label)]; });
+  const customToggle = h("input", { type: "checkbox", checked: custom });
+  const drawPerms = () => {
+    const lv = S.boot.levels[level.value];
+    const current = custom ? u.perms : lv.perms;
+    permBoxes.forEach(([cb, lab]) => { cb.checked = current.includes(cb.value) || level.value === "owner"; cb.disabled = !custom || level.value === "owner"; lab.classList.toggle("on", cb.checked); });
+  };
+  permBoxes.forEach(([cb, lab]) => cb.addEventListener("change", () => { lab.classList.toggle("on", cb.checked); u.perms = permBoxes.filter(b => b[0].checked).map(b => b[0].value); }));
+  customToggle.addEventListener("change", () => { custom = customToggle.checked; if (custom) u.perms = S.boot.levels[level.value].perms.slice(); drawPerms(); });
+  level.addEventListener("change", () => { if (isNew) access = S.boot.levels[level.value].client_access; drawAccess(); drawPerms(); });
+  drawList(); drawAccess(); drawPerms();
+  const save = () => safely(async () => {
+    const body = { name: name.value, email: email.value, level: level.value, client_access: access, client_ids: [...picked] };
+    if (custom) body.perms = permBoxes.filter(b => b[0].checked).map(b => b[0].value); else if (!isNew) body.reset_perms = true;
+    if (isNew) await api("POST", "/api/users", body); else await api("PATCH", `/api/users/${u.id}`, body);
+    closeDrawer(); toast(isNew ? `${body.name} added — they can now sign in with Google` : "Access updated"); await boot();
   });
-  boxes.forEach(b => b.querySelector("input").addEventListener("change", e => b.classList.toggle("on", e.target.checked)));
-  const permWrap = h("div", { style: "display:grid;gap:6px" }, boxes);
-  role.addEventListener("change", () => permWrap.classList.toggle("hidden", role.value === "partner"));
-  drawer("Invite a colleague", [
-    h("div", { class: "grid2" }, h("label", { class: "field" }, "Name", name), h("label", { class: "field" }, "Email (their sign-in)", email)),
-    h("label", { class: "field" }, "Role", role), h("div", { class: "small muted" }, "What can they do?"), permWrap,
-  ], [h("button", { class: "btn", onclick: closeDrawer }, "Cancel"), h("button", { class: "btn primary", onclick: () => safely(async () => {
-    const perms = boxes.map(b => b.querySelector("input")).filter(i => i.checked).map(i => i.value);
-    const r = await api("POST", "/api/users", { name: name.value, email: email.value, role: role.value, perms });
-    await boot(); showTempPassword(r.user.name, r.user.email, r.temp_password);
-  }) }, "Invite")]);
+  drawer(isNew ? "Add a team member" : `Edit ${u.name}`, [
+    isNew ? h("div", { class: "hint" }, "They'll sign in with Google using this email — no passwords to share.") : null,
+    h("div", { class: "grid2" }, h("label", { class: "field" }, "Name", name), h("label", { class: "field" }, "Google account email", email)),
+    h("label", { class: "field" }, "Level", level),
+    h("div", { class: "small muted" }, "What can they do?"),
+    h("label", { class: "row small" }, customToggle, "Customise for this person (otherwise follows the level)"),
+    h("div", { style: "display:grid;gap:6px" }, permBoxes.map(b => b[1])),
+    h("label", { class: "field" }, "Which client accounts can they see?", accessSeg), pickWrap,
+  ], [
+    !isNew && u.id !== S.me.id ? h("button", { class: "btn ghost" + (u.active ? " danger" : ""), onclick: () => safely(async () => {
+      if (u.active && !confirm(`Remove ${u.name}'s access? They'll be signed out immediately.`)) return;
+      await api("PATCH", `/api/users/${u.id}`, { active: !u.active }); closeDrawer(); toast(u.active ? "Access removed" : "Access restored"); await boot();
+    }) }, u.active ? "Remove access" : "Restore access") : null,
+    h("button", { class: "btn", onclick: closeDrawer }, "Cancel"), h("button", { class: "btn primary", onclick: save }, isNew ? "Add" : "Save")]);
 }
 
-function changePassword(forced) {
-  const cur = h("input", { class: "input", type: "password", autocomplete: "current-password" });
-  const nw = h("input", { class: "input", type: "password", autocomplete: "new-password", placeholder: "At least 8 characters" });
-  const go = () => safely(async () => {
-    await api("POST", "/api/auth/password", { current: cur.value, new: nw.value });
-    closeDrawer(); toast("Password changed"); if (forced) boot();
-  });
-  const dr = drawer(forced ? "Set your own password" : "Change password", [
-    forced ? h("div", { class: "hint" }, "You signed in with a temporary password. Choose your own to continue.") : null,
-    h("label", { class: "field" }, forced ? "Temporary password" : "Current password", cur), h("label", { class: "field" }, "New password", nw),
-  ], [forced ? null : h("button", { class: "btn", onclick: closeDrawer }, "Cancel"), h("button", { class: "btn primary", onclick: go }, "Save")]);
-  dr.addEventListener("keydown", e => e.key === "Enter" && go());
-  if (forced) { document.querySelector(".scrim").onclick = null; dr.querySelector("header button").remove(); }
+function levelsSection() {
+  const keys = LEVEL_KEYS();
+  const state = Object.fromEntries(keys.map(k => [k, new Set(S.boot.levels[k].perms)]));
+  return h("div", { class: "group" },
+    h("div", { class: "row" }, h("h3", { class: "grow" }, "What each level can do"),
+      h("button", { class: "btn sm", onclick: () => safely(async () => {
+        await api("POST", "/api/levels", { levels: Object.fromEntries(keys.filter(k => k !== "owner").map(k => [k, [...state[k]]])) });
+        toast("Levels saved — applies to everyone on that level without a custom setting"); await boot();
+      }) }, "Save levels")),
+    h("div", { class: "card", style: "overflow:auto;margin-top:8px" }, h("table", { class: "table" },
+      h("tr", {}, h("th", {}, "Level"), Object.keys(S.boot.perms).map(p => h("th", { title: S.boot.perms[p], style: "text-align:center" }, PERM_SHORT[p]))),
+      keys.map(k => h("tr", {}, h("td", {}, h("b", {}, S.boot.levels[k].label), h("div", { class: "small muted" }, S.boot.levels[k].client_access === "all" ? "all clients by default" : "selected clients by default")),
+        Object.keys(S.boot.perms).map(p => h("td", { style: "text-align:center" }, h("input", { type: "checkbox", checked: state[k].has(p), disabled: k === "owner" || null,
+          title: S.boot.perms[p], onchange: e => e.target.checked ? state[k].add(p) : state[k].delete(p) }))))))));
 }
 
 // --------------------------------------------------------------- PRIVACY
@@ -866,7 +887,7 @@ async function clientPrivacy(c, reload) {
     h("div", { class: "card pad" },
       h("div", { class: "row wrap" }, h("h2", { class: "grow", style: "margin:0" }, "Rights requests"),
         h("button", { class: "btn sm", onclick: logRequest }, "+ Log a request"),
-        can("manage_team") ? h("button", { class: "btn sm ghost danger", onclick: erase }, "Erase personal data") : null),
+        can("privacy") ? h("button", { class: "btn sm ghost danger", onclick: erase }, "Erase personal data") : null),
       d.requests.length ? h("table", { class: "table", style: "margin-top:8px" }, d.requests.map(r => h("tr", {},
         h("td", {}, r.kind), h("td", { class: "small" }, `received ${r.received_at.slice(0, 10)} · due ${r.due_at}`), h("td", {}, h("span", { class: "pill " + (r.status === "open" ? "awaiting_docs" : "filed") }, r.status)), h("td", { class: "small muted" }, r.response || "")))) :
         h("div", { class: "small muted", style: "margin-top:6px" }, "None. Log access, correction, erasure, withdrawal, grievance or nomination requests here so they're answered on time.")));
@@ -987,56 +1008,84 @@ function googleMark() {
   }
   return svg;
 }
-async function showAuth() {
+async function showAuth(chooser) {
   clearTimeout(S.poll);
   const st = await fetch("/api/auth/state", { credentials: "same-origin" }).then(r => r.json()).catch(() => ({}));
-  if (st.user && !st.setup_needed) return boot();
+  if (st.signed_in && st.firm_id && !chooser) {
+    const ok = await fetch("/api/bootstrap", { credentials: "same-origin" }).then(r => r.ok).catch(() => false);
+    if (ok) return boot();
+  }
   closeDrawer();
   document.querySelector(".shell").classList.add("hidden");
   let screen = $("#auth");
-  if (!screen) { screen = h("div", { id: "auth", class: "auth" }); document.body.append(screen); }
+  if (!screen) { screen = h("div", { id: "auth", class: "auth-screen" }); document.body.append(screen); }
   const err = h("div", { class: "small", style: "color:var(--red);min-height:18px" });
   const qs = new URLSearchParams(location.search);
   if (qs.get("auth_error")) { err.textContent = qs.get("auth_error"); history.replaceState(null, "", "/" + location.hash); }
-  const google = st.google && !st.setup_needed ? [
-    h("a", { class: "btn google", href: "/api/auth/google/start" }, googleMark(), "Continue with Google"),
-    st.google_domain ? h("div", { class: "small muted", style: "text-align:center" }, `Use your @${st.google_domain} account`) : null,
-    h("div", { class: "or" }, h("span", {}, "or with email"))] : [];
-  const field = (label, attrs) => { const i = h("input", Object.assign({ class: "input" }, attrs)); return [h("label", { class: "field" }, label, i), i]; };
-  const submit = async (fn) => { err.textContent = ""; try { await fn(); history.replaceState(null, "", "#/today"); screen.remove(); document.querySelector(".shell").classList.remove("hidden"); await boot(); } catch (e) { err.textContent = e.message; } };
   const post = async (path, body) => {
     const r = await fetch(path, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(typeof d.detail === "string" ? d.detail : "Something went wrong");
     return d;
   };
-  let form;
-  if (st.setup_needed) {
-    const [fL, firm] = field("Firm name", { placeholder: "Kulkarni & Co., Chartered Accountants" });
-    const [nL, name] = field("Your name", { placeholder: "CA Neha Kulkarni", autocomplete: "name" });
-    const [eL, email] = field("Email (your sign-in)", { type: "email", autocomplete: "email" });
-    const [pL, pw] = field("Password", { type: "password", autocomplete: "new-password", placeholder: "At least 8 characters" });
-    const agree = h("input", { type: "checkbox" });
-    form = [h("h1", {}, "Set up your office"), h("p", { class: "muted" }, "You'll be the first partner. You can invite your team next."),
-      fL, nL, eL, pL,
-      h("label", { class: "small", style: "display:flex;gap:8px;align-items:flex-start" }, agree,
-        h("span", {}, "I accept the ", h("a", { href: "/terms", target: "_blank" }, "Terms of Use & Disclaimer"),
-          " on behalf of the firm, and understand the firm is the Data Fiduciary responsible for DPDP Act compliance.")),
-      err, h("button", { class: "btn primary", type: "submit" }, "Create office")];
-    form.onsubmit = () => submit(() => post("/api/auth/setup", { firm_name: firm.value, name: name.value, email: email.value, password: pw.value, accept_terms: agree.checked }));
-  } else {
-    const [eL, email] = field("Email", { type: "email", autocomplete: "username" });
-    const [pL, pw] = field("Password", { type: "password", autocomplete: "current-password" });
-    form = [h("h1", {}, "Sign in"), h("p", { class: "muted" }, st.firm_name || ""), ...google, eL, pL, err, h("button", { class: "btn primary", type: "submit" }, "Sign in"),
-      h("div", { class: "small muted" }, "Forgot your password? Ask a partner to reset it from Settings → Team."),
-      h("div", { class: "small muted" }, "By signing in you agree to the ", h("a", { href: "/terms", target: "_blank" }, "Terms"), ". See our ",
-        h("a", { href: "/privacy", target: "_blank" }, "Privacy & Data Protection Policy"), ".")];
-    form.onsubmit = () => submit(() => post("/api/auth/login", { email: email.value, password: pw.value }));
+  const enter = async () => { screen.remove(); history.replaceState(null, "", "/#/today"); await boot(); };
+  const legal = h("div", { class: "small muted" }, "By continuing you agree to the ", h("a", { href: "/terms", target: "_blank" }, "Terms"),
+    ". See the ", h("a", { href: "/privacy", target: "_blank" }, "Privacy Policy"), ".");
+  const card = (...kids) => fill(screen, h("div", { class: "card auth-card" }, h("div", { class: "logo" }, h("div", { class: "logo-mark" }, "₹"), h("div", {}, "CA Brain", h("small", {}, "Company brain for CA firms"))), ...kids));
+
+  if (!st.signed_in) {
+    const dev = st.dev_login ? (() => {
+      const email = h("input", { class: "input", type: "email", placeholder: "you@yourfirm.in" });
+      return h("form", { style: "display:grid;gap:8px", onsubmit: e => { e.preventDefault(); err.textContent = "";
+        post("/api/auth/dev-login", { email: email.value }).then(() => showAuth()).catch(x => err.textContent = x.message); } },
+        h("div", { class: "or" }, h("span", {}, "developer sign-in (this computer only)")), email, h("button", { class: "btn", type: "submit" }, "Sign in without Google"));
+    })() : null;
+    return card(h("h1", {}, "Sign in"), h("p", { class: "muted" }, "Use the Google account your firm added you with."),
+      st.google ? h("a", { class: "btn google", href: "/api/auth/google/start" }, googleMark(), "Continue with Google")
+        : h("div", { class: "banner warn", style: "margin:0" }, "Google sign-in isn't configured on this server yet. The administrator needs to set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET."),
+      st.google_domain ? h("div", { class: "small muted", style: "text-align:center" }, `Use your @${st.google_domain} account`) : null,
+      dev, err, legal);
   }
-  const onsubmit = form.onsubmit;
-  fill(screen, h("div", { class: "card auth-card" }, h("div", { class: "logo" }, h("div", { class: "logo-mark" }, "₹"), h("div", {}, "CA Brain", h("small", {}, "Company brain"))),
-    h("form", { onsubmit: e => { e.preventDefault(); onsubmit(); } }, form)));
-  setTimeout(() => { const i = screen.querySelector("input"); i && i.focus(); }, 20);
+
+  const signOut = h("button", { class: "btn sm ghost", onclick: async () => { await post("/api/auth/logout", {}); showAuth(); } }, "Sign out");
+  const active = st.firms.filter(f => f.status === "active"), waiting = st.firms.filter(f => f.status === "pending");
+  const firmName = h("input", { class: "input", placeholder: "Kulkarni & Co., Chartered Accountants" });
+  const agree = h("input", { type: "checkbox" });
+  const createForm = h("form", { style: "display:grid;gap:10px", onsubmit: e => { e.preventDefault(); err.textContent = "";
+    post("/api/firms", { name: firmName.value, accept_terms: agree.checked }).then(r => r.pending ? showAuth(true) : enter()).catch(x => err.textContent = x.message); } },
+    h("label", { class: "field" }, "Firm name", firmName),
+    h("label", { class: "small", style: "display:flex;gap:8px;align-items:flex-start" }, agree,
+      h("span", {}, "I accept the ", h("a", { href: "/terms", target: "_blank" }, "Terms of Use & Disclaimer"),
+        " on behalf of the firm, and understand the firm is the Data Fiduciary responsible for DPDP Act compliance.")),
+    h("button", { class: "btn primary", type: "submit" }, "Create firm workspace"),
+    st.open_signup || st.is_platform_admin ? null : h("div", { class: "small muted" }, "New firms are activated after a quick check by the platform team."));
+  card(
+    h("div", { class: "row" }, h("div", { class: "grow small muted" }, "Signed in as ", h("b", {}, st.email)), signOut),
+    active.length ? [h("h1", {}, "Choose a firm"), h("div", { class: "card list", style: "box-shadow:none" }, active.map(f =>
+      h("div", { class: "item", style: "grid-template-columns:36px 1fr auto", onclick: () => post("/api/auth/firm", { firm_id: f.id }).then(enter).catch(x => err.textContent = x.message) },
+        h("span", { class: "avatar" }, initials(f.name)), h("b", {}, f.name), h("span", { class: "small muted" }, st.firm_id === f.id ? "current" : "Open →"))))] : null,
+    waiting.map(f => h("div", { class: "banner warn", style: "margin:0" }, `${f.name} is waiting for approval. You'll be able to open it once the platform team activates it.`)),
+    !active.length && !waiting.length ? [h("h1", {}, "Welcome"), h("p", { class: "muted" }, "Your Google account isn't on any firm's team yet. If your firm already uses CA Brain, ask its administrator to add ", h("b", {}, st.email), ". Or set up your firm:")] : null,
+    h("details", { open: !active.length && !waiting.length }, h("summary", { class: "small" }, "Set up a new firm workspace"), h("div", { style: "margin-top:10px" }, createForm)),
+    st.is_platform_admin ? h("button", { class: "btn", onclick: () => platformConsole(screen) }, "Platform console") : null,
+    err, legal);
+}
+
+async function platformConsole(screen) {
+  const firms = await fetch("/api/platform/firms", { credentials: "same-origin" }).then(r => r.json());
+  const act = (id, status) => fetch(`/api/platform/firms/${id}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) }).then(() => platformConsole(screen));
+  const name = h("input", { class: "input", placeholder: "Firm name" }), email = h("input", { class: "input", type: "email", placeholder: "Super admin's Google email" });
+  fill(screen, h("div", { class: "card", style: "width:min(900px,100%);padding:22px" },
+    h("div", { class: "row" }, h("h1", { class: "grow" }, "Platform console"), h("button", { class: "btn ghost", onclick: () => showAuth(true) }, "← Back")),
+    h("p", { class: "muted" }, "Approve and suspend firms. You never see a firm's clients or documents — each firm is the Data Fiduciary for its own data."),
+    h("table", { class: "table" }, h("tr", {}, h("th", {}, "Firm"), h("th", {}, "Super admin"), h("th", {}, "Team"), h("th", {}, "Clients"), h("th", {}, "Status"), h("th", {}, "")),
+      firms.map(f => h("tr", {}, h("td", {}, h("b", {}, f.name), h("div", { class: "small muted" }, `since ${f.created_at.slice(0, 10)}`)), h("td", { class: "small" }, f.owner_email),
+        h("td", {}, f.members), h("td", {}, f.clients), h("td", {}, h("span", { class: "pill " + (f.status === "active" ? "filed" : f.status === "pending" ? "awaiting_docs" : "na") }, f.status)),
+        h("td", {}, f.status !== "active" ? h("button", { class: "btn sm primary", onclick: () => act(f.id, "active") }, f.status === "pending" ? "Approve" : "Reactivate")
+          : h("button", { class: "btn sm ghost danger", onclick: () => confirm(`Suspend ${f.name}? Everyone in it is signed out.`) && act(f.id, "suspended") }, "Suspend"))))),
+    h("h2", { style: "margin-top:20px" }, "Set up a firm for a customer"),
+    h("div", { class: "row wrap" }, name, email, h("button", { class: "btn primary", onclick: () => fetch("/api/platform/firms", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: name.value, owner_email: email.value }) })
+      .then(r => r.ok ? platformConsole(screen) : r.json().then(d => toast(d.detail || "Couldn't create", true))) }, "Create"))));
 }
 
 // ------------------------------------------------------------- ASK (brain)
@@ -1140,12 +1189,11 @@ async function route() {
 }
 
 async function boot() {
-  try { S.boot = await api("GET", "/api/bootstrap"); } catch { return; }  // 401 already showed the sign-in screen
+  try { S.boot = await api("GET", "/api/bootstrap"); } catch { return showAuth(); }  // not signed in / no firm / firm not active
   S.me = S.boot.me;
   $("#auth") && $("#auth").remove();
   document.querySelector(".shell").classList.remove("hidden");
   await route();
-  if (S.me.must_change_pw) changePassword(true);
 }
 
 window.addEventListener("hashchange", () => { closeDrawer(); route(); });

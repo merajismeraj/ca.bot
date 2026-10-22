@@ -60,20 +60,24 @@ def test_start_uses_pkce_and_exact_redirect(g):
     assert "cab_oauth" in g.cookies
 
 
-def test_invited_member_signs_in_and_is_linked(g):
+def test_member_signs_in_straight_into_their_firm(g):
     q = begin(g)
     r = callback(g, q)
     assert err(r) is None and r.headers["location"] == "/#/today" and "cab_session" in r.cookies
     me = g.get("/api/bootstrap").json()["me"]
-    assert me["email"] == "arjun@x.in" and me["google_linked"] and not me["must_change_pw"]
+    assert me["email"] == "arjun@x.in" and me["level"] == "staff"
     assert g.token_posts[0]["code_verifier"] and g.token_posts[0]["redirect_uri"].startswith("https://brain.firm.in")
     # replaying the same state is refused
     assert "expired" in err(callback(g, q))
 
 
-def test_uninvited_email_rejected(g):
+def test_stranger_signs_in_but_has_no_firm(g):
     q = begin(g, email="stranger@gmail.com", sub="g-999")
-    assert "isn't on this office's team" in err(callback(g, q))
+    r = callback(g, q)
+    assert err(r) is None  # Google identity is fine...
+    st = g.get("/api/auth/state").json()
+    assert st["signed_in"] and st["firms"] == [] and st["firm_id"] is None
+    assert g.get("/api/dashboard").status_code == 409  # ...but there is no firm to enter until invited or they create one
 
 
 @pytest.mark.parametrize("claims,msg", [
@@ -105,18 +109,13 @@ def test_workspace_domain_lock(g, monkeypatch):
     assert err(callback(g, q)) is None
 
 
-def test_deactivated_and_relinked_accounts(g):
+def test_removed_member_cannot_enter(g):
+    from conftest import bearer
     q = begin(g)
     callback(g, q)
-    g.cookies.clear()
-    # a different Google account with the same email can't take over the linked member
-    q = begin(g, sub="g-OTHER")
-    assert "different Google account" in err(callback(g, q))
-    partner = g.post("/api/auth/login", json={"email": "neha@x.in", "password": "partner-pass"}).json()["token"]
-    g.patch(f"/api/users/{g.staff_id}", json={"active": False}, headers=bearer(partner))
-    g.cookies.clear()
-    q = begin(g)
-    assert "turned off" in err(callback(g, q))
+    assert g.get("/api/bootstrap").status_code == 200
+    g.patch(f"/api/users/{g.staff_id}", json={"active": False}, headers=g.partner)
+    assert g.get("/api/bootstrap").status_code == 401  # session ended immediately
 
 
 def test_cancel_and_not_configured(g, monkeypatch):

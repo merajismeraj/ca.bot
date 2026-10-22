@@ -79,7 +79,7 @@ def plain(path: str | Path) -> Iterator[Path]:
         yield path
         return
     from . import db
-    tmpdir = db.DATA_DIR / "tmp"
+    tmpdir = db.firm_dir() / "tmp"
     tmpdir.mkdir(mode=0o700, exist_ok=True)
     fd, name = tempfile.mkstemp(suffix=path.suffix, dir=tmpdir)
     try:
@@ -96,16 +96,19 @@ def delete(path: str | Path | None) -> None:
 
 
 def encrypt_all() -> int:
-    from . import db
+    from . import db, tenancy
     if not enabled():
         raise SystemExit("Set CABOT_DATA_KEY first")
     n = 0
-    with db.tx() as c:
-        for d in db.rows(c, "SELECT stored_path FROM documents WHERE stored_path IS NOT NULL"):
-            p = Path(d["stored_path"])
-            if p.exists() and not is_encrypted(p):
-                write(p, p.read_bytes())
-                n += 1
+    tenancy.init()
+    for f in tenancy.firms():
+        with db.use_firm(f["id"]):
+            with db.tx() as c:
+                for d in db.rows(c, "SELECT stored_path FROM documents WHERE stored_path IS NOT NULL"):
+                    p = Path(d["stored_path"])
+                    if p.exists() and not is_encrypted(p):
+                        write(p, p.read_bytes())
+                        n += 1
     return n
 
 

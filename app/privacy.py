@@ -91,7 +91,8 @@ def withdrawn(conn, client_id: int | None) -> bool:
 def notice_message(conn, client: dict, base_url: str) -> str:
     s = settings(conn)
     firm = db.get_setting(conn, "firm_name", "our office")
-    url = (s["public_url"] or base_url).rstrip("/") + "/privacy"
+    from . import tenancy
+    url = (s["public_url"] or base_url).rstrip("/") + f"/privacy?firm={tenancy.firm(db.current_firm())['slug']}"
     greet = client.get("guardian_name") if client.get("is_minor") else (client.get("contact_name") or client["name"])
     lines = [f"Namaste {greet},", "",
              f"{firm} processes your personal and financial information (identity details, bank statements, invoices, "

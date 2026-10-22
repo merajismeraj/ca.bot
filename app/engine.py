@@ -239,7 +239,7 @@ def ingest(conn, rel_path: str, data: bytes, user: dict | None, batch_id: str, h
         return {"filename": rel_path, "skipped": True, "reason": f"Unsupported file type {suffix or '(none)'}"}
     if not data:
         return {"filename": rel_path, "skipped": True, "reason": "Empty file"}
-    stored = db.UPLOAD_DIR / f"{sha[:2]}/{sha}{suffix}"
+    stored = db.upload_dir() / f"{sha[:2]}/{sha}{suffix}"
     storage.write(stored, data)
     with storage.plain(stored) as p:
         text = classifier.extract_text(p)

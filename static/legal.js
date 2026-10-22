@@ -1,7 +1,10 @@
 /* Fills the office's own details into the public legal pages; anything not yet set is highlighted. */
 "use strict";
 (async () => {
-  const info = await fetch("/api/public/info").then(r => r.json()).catch(() => ({}));
+  const firm = new URLSearchParams(location.search).get("firm");
+  const info = await fetch("/api/public/info" + (firm ? `?firm=${encodeURIComponent(firm)}` : "")).then(r => r.json()).catch(() => ({}));
+  document.body.dataset.scope = info.scope || "firm";
+  document.querySelectorAll("a[href='/terms'],a[href='/privacy']").forEach(a => { if (firm) a.href += `?firm=${encodeURIComponent(firm)}`; });
   const missing = { firm_address: "[office address]", officer_name: "[grievance officer name]",
     officer_email: "[grievance officer email]", officer_phone: "[grievance officer phone]",
     jurisdiction: "[city of the office]", policy_updated: "[date]" };
@@ -22,5 +25,5 @@
   const enc = document.querySelector(".enc");
   if (enc) enc.textContent = info.encrypted ? "Client documents are encrypted at rest (AES-256)." : "Client documents are stored on access-controlled servers.";
   const toc = document.querySelector(".toc");
-  if (toc) document.querySelectorAll("h2[id]").forEach(h => { const a = document.createElement("a"); a.href = `#${h.id}`; a.textContent = h.textContent; toc.append(a); });
+  if (toc) document.querySelectorAll(`.${info.scope === "platform" ? "platform" : "firm"}-only h2[id]`).forEach(h => { const a = document.createElement("a"); a.href = `#${h.id}`; a.textContent = h.textContent; toc.append(a); });
 })();

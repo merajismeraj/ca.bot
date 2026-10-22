@@ -1,6 +1,15 @@
-"""SQLite persistence. One file, no ORM, safe to back up by copying."""
+"""SQLite persistence. No ORM.
+
+Multi-firm by isolation: every firm has its own database file and upload folder
+under DATA_DIR/firms/<id>/. Which firm a connection opens is decided by a
+context variable set once per request (from the signed-in session) or per
+background job - business code never passes a firm id, so it cannot read
+another firm's data by forgetting a WHERE clause. The platform database
+(firms, memberships, sessions) lives in platform.py.
+"""
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import sqlite3
@@ -9,13 +18,54 @@ from datetime import datetime
 from pathlib import Path
 
 DATA_DIR = Path(os.environ.get("CABOT_DATA", Path(__file__).resolve().parent.parent / "data"))
-DB_PATH = DATA_DIR / "cabot.db"
-UPLOAD_DIR = DATA_DIR / "uploads"
+
+_firm: contextvars.ContextVar[int | None] = contextvars.ContextVar("firm", default=None)
+
+
+class NoFirm(RuntimeError):
+    pass
+
+
+def current_firm() -> int:
+    fid = _firm.get()
+    if fid is None:
+        raise NoFirm("No firm selected for this operation")
+    return fid
+
+
+def firm_dir(fid: int | None = None) -> Path:
+    return DATA_DIR / "firms" / str(current_firm() if fid is None else fid)
+
+
+def db_path() -> Path:
+    return firm_dir() / "cabot.db"
+
+
+def upload_dir() -> Path:
+    return firm_dir() / "uploads"
+
+
+@contextmanager
+def use_firm(fid: int):
+    """Run a block against one firm's database (requests set this via auth.current)."""
+    token = _firm.set(fid)
+    try:
+        yield
+    finally:
+        _firm.reset(token)
+
+
+def set_firm(fid: int | None) -> None:
+    _firm.set(fid)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('staff','partner'))
+);
+CREATE TABLE IF NOT EXISTS user_clients (
+  user_id INT NOT NULL REFERENCES users(id), client_id INT NOT NULL REFERENCES clients(id),
+  PRIMARY KEY (user_id, client_id)
 );
 CREATE TABLE IF NOT EXISTS clients (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, pan TEXT UNIQUE, gstin TEXT, tan TEXT,
@@ -86,9 +136,8 @@ def now() -> str:
 
 
 def connect() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    upload_dir().mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path(), timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
@@ -114,7 +163,8 @@ MIGRATIONS = {
     "clients": {"consent_status": "TEXT DEFAULT 'pending'", "consent_at": "TEXT", "notice_at": "TEXT",
                 "is_minor": "INT DEFAULT 0", "guardian_name": "TEXT", "erased_at": "TEXT"},
     "users": {"google_sub": "TEXT", "email": "TEXT", "pw_hash": "TEXT", "perms": "TEXT DEFAULT '[]'", "active": "INT DEFAULT 1",
-              "must_change_pw": "INT DEFAULT 0", "phone": "TEXT"},
+              "must_change_pw": "INT DEFAULT 0", "phone": "TEXT", "level": "TEXT",
+              "client_access": "TEXT DEFAULT 'all'", "last_login": "TEXT"},
     "documents": {"ocr_status": "TEXT DEFAULT ''", "hint_client_id": "INT", "source": "TEXT DEFAULT 'upload'"},
     "messages": {"direction": "TEXT DEFAULT 'out'", "from_phone": "TEXT", "wa_message_id": "TEXT",
                  "error": "TEXT", "sent_by": "INT"},
@@ -122,6 +172,7 @@ MIGRATIONS = {
 
 
 def init() -> None:
+    """Create or upgrade the current firm's database."""
     with tx() as c:
         c.executescript(SCHEMA)
         for table, cols in MIGRATIONS.items():

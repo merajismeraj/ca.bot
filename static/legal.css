@@ -11,3 +11,4 @@
 .legal .toc { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 12px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; font-size: 13px; }
 .todo { background: var(--amber-soft); color: var(--amber); border-radius: 4px; padding: 0 4px; font-weight: 600; }
 @media (max-width: 600px) { .legal dl { grid-template-columns: 1fr; } }
+body[data-scope="platform"] .firm-only, body:not([data-scope="platform"]) .platform-only { display: none; }

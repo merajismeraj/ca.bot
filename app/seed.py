@@ -7,7 +7,6 @@ Run: python -m app.seed   (only into an empty data directory)
 from __future__ import annotations
 
 import io
-import json
 import random
 from datetime import date, timedelta
 
@@ -32,7 +31,6 @@ CLIENTS = [
 ]
 
 rng = random.Random(7)
-DEMO_PASSWORD = "demo-office-2026"
 
 
 def bank_csv(holder: str, mk: str) -> bytes:
@@ -181,24 +179,18 @@ def run() -> list[dict]:
     with db.tx() as c:
         if db.rows(c, "SELECT id FROM clients LIMIT 1"):
             raise SystemExit("Data directory already has clients; demo not loaded.")
+        from . import tenancy
         logins = []
-        partner = db.row(c, "SELECT * FROM users WHERE role='partner' AND active=1 ORDER BY id LIMIT 1")
-        if not partner:
-            c.execute("INSERT INTO users(name, role, email, pw_hash, perms) VALUES(?,?,?,?,'[]')",
-                      ("CA Neha Kulkarni", "partner", "neha@demo.local", auth.hash_pw(DEMO_PASSWORD)))
-            logins.append({"name": "CA Neha Kulkarni", "email": "neha@demo.local", "role": "partner"})
-        # Arjun sees every client; Priya only the clients assigned to her - to show per-person access
-        for name, email, perms in (("Arjun", "arjun@demo.local", auth.STAFF_DEFAULT),
-                                   ("Priya", "priya@demo.local", ["send_messages", "manage_clients"])):
+        # Arjun (manager) sees every client; Priya (article) only the client accounts assigned to her
+        for name, email, level in (("Arjun", "arjun@demo.local", "manager"), ("Priya", "priya@demo.local", "article")):
             if not db.row(c, "SELECT id FROM users WHERE email=?", (email,)):
-                c.execute("INSERT INTO users(name, role, email, pw_hash, perms) VALUES(?,?,?,?,?)",
-                          (name, "staff", email, auth.hash_pw(DEMO_PASSWORD), json.dumps(perms)))
-                logins.append({"name": name, "email": email, "role": "staff"})
-        db.set_setting(c, "firm_name", "Kulkarni & Co., Chartered Accountants")
+                uid = c.execute("INSERT INTO users(name, role, email, level, client_access, perms) VALUES(?,?,?,?,?,NULL)",
+                                (name, auth.role_for(level), email, level, auth.LEVELS[level][2])).lastrowid
+                tenancy.add_membership(email, db.current_firm(), uid)
+                logins.append({"name": name, "email": email, "level": auth.LEVELS[level][0]})
         db.set_setting(c, "tracking_start", date(cur, 4, 1).isoformat())
-        partner = db.row(c, "SELECT * FROM users WHERE role='partner' ORDER BY id LIMIT 1")
-        staff = db.rows(c, "SELECT * FROM users WHERE role='staff' AND email LIKE '%@demo.local' ORDER BY id") or \
-            db.rows(c, "SELECT * FROM users WHERE role='staff' ORDER BY id") or [partner]
+        partner = db.row(c, "SELECT * FROM users WHERE level='owner' AND active=1 ORDER BY id LIMIT 1")
+        staff = db.rows(c, "SELECT * FROM users WHERE email LIKE '%@demo.local' AND level!='owner' ORDER BY id") or [partner]
         for i, spec in enumerate(CLIENTS):
             spec = dict(spec, assignee_id=staff[i % len(staff)]["id"])
             _create_client(c, ClientIn(**spec), partner)
@@ -229,10 +221,18 @@ def run() -> list[dict]:
             c.execute("INSERT INTO messages(client_id,channel,subject,body,status,created_at) VALUES(?,?,?,?,'draft',?)",
                       (sharma, "whatsapp", draft["subject"], draft["body"], db.now()))
         db.log(c, partner["id"], "demo", "batch", None, "Demo office loaded")
-    return [dict(l, password=DEMO_PASSWORD) for l in logins]
+    return logins
 
 
 if __name__ == "__main__":
-    for l in run():
-        print(f"{l['role']:8} {l['email']:22} {l['password']}")
-    print("Demo data loaded.")
+    import sys
+    from . import tenancy
+    owner = sys.argv[1] if len(sys.argv) > 1 else "neha@demo.local"
+    tenancy.init()
+    firm, _ = tenancy.create_firm("Kulkarni & Co., Chartered Accountants", owner, "CA Neha Kulkarni", None, "active")
+    with db.use_firm(firm["id"]):
+        team = run()
+    print(f"Demo firm #{firm['id']} created. Super admin: {owner}")
+    for l in team:
+        print(f"  {l['level']:20} {l['email']}")
+    print("Sign in with Google as one of these emails, or for local testing run with CABOT_DEV_LOGIN=1.")

@@ -1,9 +1,8 @@
-"""Sign in with Google (OpenID Connect, authorization-code flow with PKCE).
+"""Sign in with Google (OpenID Connect, authorization-code flow with PKCE) - the only way in.
 
-Invite-only by design: Google proves who someone is; whether they may enter is
-still decided by the office. A Google account signs in only if its verified
-email matches an active team member a partner has invited (or the account was
-linked earlier). Optionally restrict to one Google Workspace domain.
+Google proves who someone is; which firms they may enter is decided by each
+firm's super admin (memberships), and creating a new firm needs platform approval.
+Optionally restrict sign-in to one Google Workspace domain (single-firm deployments).
 
 Config (env): GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, optional
 GOOGLE_ALLOWED_DOMAIN (e.g. yourfirm.in), CABOT_PUBLIC_URL (https://... used to
@@ -26,7 +25,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from . import db
+from . import db, tenancy
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -57,12 +56,13 @@ def _b64url(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
 
-def start(conn, request_base: str) -> tuple[str, str]:
+def start(request_base: str) -> tuple[str, str]:
     """Return (Google URL to redirect to, browser-binding value for a cookie)."""
     state, nonce, verifier, browser = (secrets.token_urlsafe(32) for _ in range(4))
-    conn.execute("DELETE FROM oauth_states WHERE created_at<?", ((datetime.now() - STATE_TTL).isoformat(timespec="seconds"),))
-    conn.execute("INSERT INTO oauth_states(state,nonce,verifier,browser,created_at) VALUES(?,?,?,?,?)",
-                 (state, nonce, verifier, hashlib.sha256(browser.encode()).hexdigest(), db.now()))
+    with tenancy.tx() as conn:
+        conn.execute("DELETE FROM oauth_states WHERE created_at<?", ((datetime.now() - STATE_TTL).isoformat(timespec="seconds"),))
+        conn.execute("INSERT INTO oauth_states(state,nonce,verifier,browser,created_at) VALUES(?,?,?,?,?)",
+                     (state, nonce, verifier, hashlib.sha256(browser.encode()).hexdigest(), db.now()))
     params = {
         "client_id": os.environ["GOOGLE_CLIENT_ID"], "redirect_uri": redirect_uri(request_base),
         "response_type": "code", "scope": "openid email profile", "state": state, "nonce": nonce,
@@ -82,10 +82,11 @@ def _claims(id_token: str) -> dict:
         raise GoogleError("Google sent an unreadable sign-in token") from e
 
 
-def finish(conn, code: str, state: str, browser: str | None, request_base: str) -> dict:
-    """Validate Google's response and return the matching active team member (linking the Google account)."""
-    row = db.row(conn, "SELECT * FROM oauth_states WHERE state=?", (state or "",))
-    conn.execute("DELETE FROM oauth_states WHERE state=?", (state or "",))  # single use
+def finish(code: str, state: str, browser: str | None, request_base: str) -> dict:
+    """Validate Google's response; return the verified identity {email, sub, name}."""
+    with tenancy.tx() as conn:
+        row = db.row(conn, "SELECT * FROM oauth_states WHERE state=?", (state or "",))
+        conn.execute("DELETE FROM oauth_states WHERE state=?", (state or "",))  # single use
     if not row or datetime.fromisoformat(row["created_at"]) < datetime.now() - STATE_TTL:
         raise GoogleError("This sign-in link expired. Please try again.")
     if not browser or hashlib.sha256(browser.encode()).hexdigest() != row["browser"]:
@@ -113,17 +114,4 @@ def finish(conn, code: str, state: str, browser: str | None, request_base: str) 
     if dom and (c.get("hd") or "").lower() != dom:
         raise GoogleError(f"Use your @{dom} Google Workspace account.")
 
-    sub = str(c.get("sub") or "")
-    user = db.row(conn, "SELECT * FROM users WHERE google_sub=?", (sub,)) if sub else None
-    if not user:
-        user = db.row(conn, "SELECT * FROM users WHERE email=?", (email,))
-        if user and user["google_sub"] and user["google_sub"] != sub:
-            raise GoogleError("This team member is linked to a different Google account.")
-    if not user:
-        raise GoogleError(f"{email} isn't on this office's team. Ask a partner to invite you with this email.")
-    if not user["active"]:
-        raise GoogleError("Your access to this office has been turned off. Contact a partner.")
-    # link the Google account; a verified Google identity replaces the temporary-password step
-    conn.execute("UPDATE users SET google_sub=?, must_change_pw=0, name=COALESCE(NULLIF(name,''),?) WHERE id=?",
-                 (sub, c.get("name") or email, user["id"]))
-    return db.row(conn, "SELECT * FROM users WHERE id=?", (user["id"],))
+    return {"email": email, "sub": str(c.get("sub") or ""), "name": c.get("name") or email}

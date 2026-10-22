@@ -7,22 +7,23 @@ def client(api, **kw):
     return api.post("/api/clients", json={"name": "Sharma Traders", "gstin": "27ABCPS1234K1Z5", "phone": "9820012345"} | kw).json()
 
 
-def test_setup_requires_terms(fresh):
-    from fastapi.testclient import TestClient
-    from app.main import app
-    with TestClient(app) as c:
-        r = c.post("/api/auth/setup", json={"firm_name": "X", "name": "Y", "email": "y@x.in", "password": "longenough"})
-        assert r.status_code == 400 and "Terms" in r.json()["detail"]
+def test_new_firm_requires_terms(api):
+    from conftest import login
+    h = login("new@firm.in")
+    r = api.post("/api/firms", json={"name": "New Firm"}, headers=h)
+    assert r.status_code == 400 and "Terms" in r.json()["detail"]
 
 
 def test_public_pages_without_login(api):
     client(api)
-    for path, words in (("/privacy", "Data Fiduciary"), ("/terms", "Limitation of liability")):
+    for path, words in (("/privacy", "Data Fiduciary"), ("/terms", "Limitation of liability"), ("/privacy", "people who sign in")):
         r = api.get(path, headers={"Authorization": ""})
         assert r.status_code == 200 and words in r.text
     api.post("/api/privacy/settings", json={"officer_name": "Neha", "officer_email": "dpo@x.in", "retention_years": 8,
                                             "response_days": 120})
-    info = api.get("/api/public/info", headers={"Authorization": ""}).json()
+    info = api.get(f"/api/public/info?firm={api.firm['slug']}", headers={"Authorization": ""}).json()
+    assert info["scope"] == "firm" and info["firm_name"] == "Test & Co"
+    assert api.get("/api/public/info", headers={"Authorization": ""}).json()["scope"] == "platform"
     assert info["officer_email"] == "dpo@x.in" and info["response_days"] == 90  # capped at the Rules' maximum
     assert "ABCPS1234K" not in str(info) and "Sharma" not in str(info)  # no client data on public endpoints
 

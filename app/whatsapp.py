@@ -11,7 +11,10 @@ Outbound : a person clicks "Send on WhatsApp" on a draft. Meta only allows a
            approved template, if configured) instead. Nothing is ever sent
            without a click.
 
-Config (env): WA_TOKEN, WA_PHONE_NUMBER_ID, WA_VERIFY_TOKEN, WA_APP_SECRET,
+One Meta app for the whole platform (env: WA_TOKEN, WA_VERIFY_TOKEN, WA_APP_SECRET);
+each firm connects its own business number (phone number ID, set in the firm's
+Settings). Inbound webhooks are routed to the firm that owns the receiving number.
+Optional env:
 optional WA_API_VERSION, WA_TEMPLATE (name of an approved template with one
 body parameter, used outside the 24 h window), WA_TEMPLATE_LANG.
 """
@@ -42,8 +45,19 @@ def cfg(key: str, default: str | None = None) -> str | None:
     return os.environ.get(key, default)
 
 
+def platform_configured() -> bool:
+    return bool(cfg("WA_TOKEN") and cfg("WA_APP_SECRET") and cfg("WA_VERIFY_TOKEN"))
+
+
+def phone_number_id() -> str | None:
+    """The current firm's WhatsApp business number (Meta phone number ID)."""
+    from . import tenancy
+    f = tenancy.firm(db.current_firm())
+    return f["wa_phone_number_id"] if f else None
+
+
 def configured() -> bool:
-    return bool(cfg("WA_TOKEN") and cfg("WA_PHONE_NUMBER_ID") and cfg("WA_APP_SECRET") and cfg("WA_VERIFY_TOKEN"))
+    return platform_configured() and bool(phone_number_id())
 
 
 def api_url(path: str) -> str:
@@ -88,10 +102,11 @@ def handle_webhook(payload: dict) -> list[dict]:
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
+            number = (value.get("metadata") or {}).get("phone_number_id")
             names = {c.get("wa_id"): c.get("profile", {}).get("name") for c in value.get("contacts", [])}
             for m in value.get("messages", []):
                 kind = m.get("type")
-                item = {"wa_message_id": m.get("id"), "from": m.get("from"), "profile": names.get(m.get("from")),
+                item = {"wa_message_id": m.get("id"), "from": m.get("from"), "profile": names.get(m.get("from")), "number": number,
                         "kind": kind, "ts": m.get("timestamp")}
                 if kind == "text":
                     item["text"] = m.get("text", {}).get("body", "")
@@ -106,49 +121,61 @@ def handle_webhook(payload: dict) -> list[dict]:
 
 
 def process(items: list[dict]) -> None:
-    """Store texts, download and ingest attachments. Runs after the webhook has already answered 200."""
+    """Route each message to the firm that owns the receiving number, then handle it inside that firm."""
+    from . import tenancy
     for it in items:
-        with db.tx() as c:
-            if it["wa_message_id"] and db.row(c, "SELECT id FROM messages WHERE wa_message_id=?", (it["wa_message_id"],)):
-                continue  # Meta retries deliveries; process each message once
-            client = client_for_phone(c, it["from"])
-            cid = client["id"] if client else None
-            who = client["name"] if client else (it.get("profile") or f"+{it['from']}")
-            body = it.get("text") or ""
-            if it["kind"] in ("document", "image"):
-                body = (f"📎 {it.get('filename') or it['kind']}" + (f" — {body}" if body else ""))
-            c.execute("INSERT INTO messages(client_id,channel,subject,body,status,created_at,direction,from_phone,wa_message_id) "
-                      "VALUES(?,?,?,?,?,?,?,?,?)",
-                      (cid, "whatsapp", None, body, "received", db.now(), "in", local_phone(it["from"]), it["wa_message_id"]))
-            db.log(c, None, "wa_in", "client" if cid else "whatsapp", cid, f"WhatsApp from {who}: {body[:80]}")
-        if it["kind"] not in ("document", "image") or not it.get("media_id"):
+        with tenancy.tx() as pc:
+            f = db.row(pc, "SELECT id FROM firms WHERE wa_phone_number_id=? AND status='active'", (it.get("number"),))
+        if not f:
+            log.warning("WhatsApp message for unknown number %s dropped", it.get("number"))
             continue
-        with db.tx() as c:
-            from . import privacy
-            if privacy.withdrawn(c, cid):
-                db.log(c, None, "wa_in", "client", cid, "Attachment not stored: client has withdrawn consent")
-                continue
-        try:
-            data, mime = download_media(it["media_id"])
-        except Exception as e:
-            log.warning("media download failed: %s", e)
-            continue
-        ext = Path(it.get("filename") or "").suffix.lower() or MIME_EXT.get((mime or it.get("mime") or "").split(";")[0], "")
-        stem = Path(it.get("filename") or "").stem or f"{it['kind']}-{it['wa_message_id'][-8:]}"
-        caption = re.sub(r"[\\/:*?\"<>|]", " ", it.get("text") or "")[:80].strip()
-        name = f"{stem}{(' ' + caption) if caption and caption.lower() not in stem.lower() else ''}{ext}"
-        folder = f"WhatsApp/{who}"
-        batch = f"wa-{datetime.now():%Y%m%d}"
-        with db.tx() as c:
-            if ext == ".zip":
-                import io
-                from . import archive
-                for e in archive.expand(name, io.BytesIO(data)):
-                    if e.data is not None:
-                        engine.ingest(c, f"{folder}/{e.path}", e.data, None, batch, cid, source="whatsapp")
-            else:
-                engine.ingest(c, f"{folder}/{name}", data, None, batch, cid, source="whatsapp")
-            engine.folder_consensus(c, batch)
+        with db.use_firm(f["id"]):
+            _process_one(it)
+
+
+def _process_one(it: dict) -> None:
+    """Store texts, download and ingest attachments. Runs after the webhook has already answered 200."""
+    with db.tx() as c:
+        if it["wa_message_id"] and db.row(c, "SELECT id FROM messages WHERE wa_message_id=?", (it["wa_message_id"],)):
+            return  # Meta retries deliveries; process each message once
+        client = client_for_phone(c, it["from"])
+        cid = client["id"] if client else None
+        who = client["name"] if client else (it.get("profile") or f"+{it['from']}")
+        body = it.get("text") or ""
+        if it["kind"] in ("document", "image"):
+            body = (f"📎 {it.get('filename') or it['kind']}" + (f" — {body}" if body else ""))
+        c.execute("INSERT INTO messages(client_id,channel,subject,body,status,created_at,direction,from_phone,wa_message_id) "
+                  "VALUES(?,?,?,?,?,?,?,?,?)",
+                  (cid, "whatsapp", None, body, "received", db.now(), "in", local_phone(it["from"]), it["wa_message_id"]))
+        db.log(c, None, "wa_in", "client" if cid else "whatsapp", cid, f"WhatsApp from {who}: {body[:80]}")
+    if it["kind"] not in ("document", "image") or not it.get("media_id"):
+        return
+    with db.tx() as c:
+        from . import privacy
+        if privacy.withdrawn(c, cid):
+            db.log(c, None, "wa_in", "client", cid, "Attachment not stored: client has withdrawn consent")
+            return
+    try:
+        data, mime = download_media(it["media_id"])
+    except Exception as e:
+        log.warning("media download failed: %s", e)
+        return
+    ext = Path(it.get("filename") or "").suffix.lower() or MIME_EXT.get((mime or it.get("mime") or "").split(";")[0], "")
+    stem = Path(it.get("filename") or "").stem or f"{it['kind']}-{it['wa_message_id'][-8:]}"
+    caption = re.sub(r"[\\/:*?\"<>|]", " ", it.get("text") or "")[:80].strip()
+    name = f"{stem}{(' ' + caption) if caption and caption.lower() not in stem.lower() else ''}{ext}"
+    folder = f"WhatsApp/{who}"
+    batch = f"wa-{datetime.now():%Y%m%d}"
+    with db.tx() as c:
+        if ext == ".zip":
+            import io
+            from . import archive
+            for e in archive.expand(name, io.BytesIO(data)):
+                if e.data is not None:
+                    engine.ingest(c, f"{folder}/{e.path}", e.data, None, batch, cid, source="whatsapp")
+        else:
+            engine.ingest(c, f"{folder}/{name}", data, None, batch, cid, source="whatsapp")
+        engine.folder_consensus(c, batch)
 
 
 # --------------------------------------------------------------- outbound
@@ -183,7 +210,7 @@ def send(conn, phone: str, body: str) -> str:
         raise SendError("The client hasn't messaged in the last 24 hours, so WhatsApp only allows an approved template. "
                         "Use “Open WhatsApp” to send from your phone, or set WA_TEMPLATE.")
     try:
-        r = httpx.post(api_url(f"{cfg('WA_PHONE_NUMBER_ID')}/messages"), headers=headers(), json=payload, timeout=30)
+        r = httpx.post(api_url(f"{phone_number_id()}/messages"), headers=headers(), json=payload, timeout=30)
     except httpx.HTTPError as e:
         raise SendError(f"Couldn't reach WhatsApp ({type(e).__name__})") from e
     if r.status_code >= 400:

@@ -18,8 +18,8 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/uvicorn app.main:app --port 8000          # open http://localhost:8000
 ```
 
-The first visit sets up the office and its first partner login. Then **Try with demo data** loads six clients, ~110
-synthetic files (including a phone photo that only OCR can read), and two staff logins to try permissions with.
+Sign in with Google and create your firm. Then **Try with demo data** loads six clients, ~110 synthetic files
+(including a phone photo that only OCR can read) and two team members — a Manager, and an Article on selected clients.
 Install `tesseract-ocr` (and `tesseract-ocr-hin`) for scanned documents — the Docker image includes both:
 `docker build -t ca-brain . && docker run -p 8000:8000 -v $PWD/data:/data ca-brain`.
 
@@ -37,10 +37,14 @@ Install `tesseract-ocr` (and `tesseract-ocr-hin`) for scanned documents — the 
 | `CABOT_VISION_OCR` | `0` | `1` sends scans Tesseract can't read to Claude vision (file contents leave the office) |
 | `CABOT_OCR_LANGS` | `eng`+`hin` if installed | Tesseract languages |
 | `CABOT_MAX_UPLOAD_MB` / `CABOT_ZIP_MAX_MB` / `CABOT_ZIP_MAX_FILES` | 4096 / 4096 / 10000 | Upload and zip limits |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | – | Sign in with Google (both required) |
-| `GOOGLE_ALLOWED_DOMAIN` | – | Only accept Google Workspace accounts on this domain, e.g. `yourfirm.in` |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | – | Sign in with Google — required, it is the only way in. Create a *Web application* OAuth client and register `https://<host>/api/auth/google/callback` |
+| `CABOT_PLATFORM_ADMINS` | – | Comma-separated Google emails of platform owners |
+| `CABOT_OPEN_SIGNUP` | `0` | `1` = new firms are active immediately instead of awaiting approval |
+| `CABOT_DEV_LOGIN` | `0` | `1` = localhost-only sign-in without Google, for development |
+| `CABOT_PROVIDER_CONTACT_EMAIL` / `_NAME` / `_PHONE`, `CABOT_PROVIDER_ADDRESS`, `CABOT_JURISDICTION`, `CABOT_POLICY_UPDATED` | – | The platform's own privacy notice and Terms |
+| `GOOGLE_ALLOWED_DOMAIN` | – | Only accept Google Workspace accounts on one domain (for a single-firm deployment) |
 | `CABOT_PUBLIC_URL` | from request | Public https address; used for the Google redirect URI and links in notices |
-| `WA_TOKEN`, `WA_PHONE_NUMBER_ID`, `WA_VERIFY_TOKEN`, `WA_APP_SECRET` | – | WhatsApp Business Cloud API (all four required) |
+| `WA_TOKEN`, `WA_VERIFY_TOKEN`, `WA_APP_SECRET` | – | The platform's WhatsApp Business Cloud API app; each firm enters its own phone number ID in Settings |
 | `WA_TEMPLATE`, `WA_TEMPLATE_LANG`, `WA_API_VERSION` | –, `en`, `v21.0` | Approved template for messages outside the 24 h window; Graph API version |
 
 Tests: `.venv/bin/pip install -r requirements-dev.txt && .venv/bin/python -m pytest`
@@ -63,34 +67,43 @@ Tests: `.venv/bin/pip install -r requirements-dev.txt && .venv/bin/python -m pyt
   “add client Verma Exports 07AABCV1234D1Z3 audit tds payroll”, “extend GSTR-9 FY 2025-26 to 31 Jan 2027 per notification …”.
   Reads answer instantly; changes come back as proposals with a Confirm button.
 
-## Logins and permissions
+## Firms, sign-in and access
 
-Every person signs in with their own email and password (scrypt-hashed; sessions are server-side tokens in an
-HttpOnly cookie, or `Authorization: Bearer` for scripts). Partners invite colleagues from **Settings → Team**; the
-invite produces a one-time password that must be changed on first sign-in. Five failed attempts lock that email for
-15 minutes. Partners hold every permission; for staff each one is a checkbox:
+One platform, many CA firms, each fully isolated: every firm has its **own database file and upload folder**
+(`data/firms/<id>/`). Requests are bound to the signed-in person's firm before any query runs, so one firm's data
+can't reach another through a missed filter. A small platform database holds only firms, memberships and sessions.
 
-| Permission | Lets them |
-|---|---|
-| Approve | approve filings, due-date extensions, N/A and reopenings, sign off the FY calendar |
-| Clients | add, edit clients |
-| Message | send messages to clients (others can draft) |
-| All clients | see every client — otherwise only clients or filings assigned to them, everywhere including the command bar |
-| Export | download client files as zip |
-| Team | invite people, set permissions, change office settings |
+**Sign-in is Google only** (OpenID Connect, PKCE, browser-bound single-use state; issuer, audience, expiry, nonce and
+verified email checked). No passwords exist anywhere.
 
-### Sign in with Google
+1. **A firm signs up.** Anyone signs in with Google and creates a firm workspace (accepting the Terms). They become
+   its **Super admin**. Unless `CABOT_OPEN_SIGNUP=1`, the firm stays *pending* until a platform owner approves it.
+2. **Platform owners** (`CABOT_PLATFORM_ADMINS=you@company.in`) get a console to approve, suspend (signs everyone out)
+   and set up firms for customers. They see firm names, team and client *counts* — never client data.
+3. **The super admin builds the team.** Add a person by their Google email, pick a **level**, and choose **which
+   client accounts** they can see. They just "Continue with Google". Removing someone ends their sessions at once.
+   People in several firms pick a firm after sign-in and can switch.
 
-Invite-only: a Google account gets in only if its verified email matches an active team member a partner has
-invited (the account is then linked, and later sign-ins match it even if the email changes). Strangers with a
-Google account are turned away. Optionally lock it to your Google Workspace domain. Email + password keeps working,
-so a Google outage or misconfiguration can't lock the office out.
+| Level | Default permissions | Default client access |
+|---|---|---|
+| Super admin | everything (fixed); only super admins can create or change super admins | all |
+| Partner | documents, work, approve, clients, message, export, privacy | all |
+| Manager | documents, work, clients, message, export | all |
+| Staff | documents, work, message | selected |
+| Article / trainee | documents, work | selected |
+| Viewer (read-only) | — (sees filings and calendar, not documents) | selected |
 
-Setup: in Google Cloud Console → APIs & Services → Credentials, create an **OAuth client ID** (type *Web application*),
-add the redirect URI shown in **Settings → Connections** (`https://<your-host>/api/auth/google/callback`), and set
-`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`. The consent screen only needs the `openid`, `email` and `profile` scopes.
-The flow uses PKCE, single-use state bound to the browser (stops login CSRF), and checks issuer, audience, expiry,
-nonce, verified email and Workspace domain.
+Permissions: **Documents** (open/download files) · **Work** (upload, sort the Inbox, move filings) · **Approve** ·
+**Clients** (add/edit profiles) · **Message** · **Export** · **Privacy** (DPDP requests, breaches, erasure) · **Team**.
+Each firm can retune what every level can do; any person can also get a custom set. Client access is *all* or
+*selected accounts* (plus anything assigned to them) and applies everywhere — lists, calendar, documents, the
+command bar. A firm always keeps at least one active super admin.
+
+**Local development without Google:** `CABOT_DEV_LOGIN=1` adds a "sign in without Google" box that works only from
+localhost and never when `CABOT_SECURE_COOKIES=1`. `python -m app.seed [owner@email]` creates a demo firm.
+
+**Upgrading a single-office install:** on first start the old `data/cabot.db` and uploads become firm #1, people
+keep their access (the first partner becomes super admin) and now sign in with Google using their email.
 
 ## Zips in, zips out
 
@@ -138,9 +151,10 @@ the controls and records the Act and the DPDP Rules, 2025 expect; it does not ma
 | Grievance contact (s.8(9)) | Officer name / email / phone published on the policy |
 | Readiness | Checklist of what's still missing (officer, address, consent coverage, encryption, HTTPS, backups, overdue requests, breaches, retention) |
 
-Public pages, no login: **`/privacy`** (Privacy & Data Protection Policy, filled with the office's details; anything
-not yet set is highlighted) and **`/terms`** (Terms of Use & Disclaimer). The first partner must accept the Terms when
-setting up the office; acceptance is recorded. Set `CABOT_PROVIDER_NAME` to name the software provider in both pages.
+Public pages, no login: **`/privacy?firm=<slug>`** (each firm's own Privacy & Data Protection Policy, filled with
+its details; anything not yet set is highlighted — linked from client notices), **`/privacy`** (the platform's notice
+for people who sign in) and **`/terms`** (Terms of Use & Disclaimer). Whoever creates a firm must accept the Terms;
+acceptance is recorded. Set `CABOT_PROVIDER_NAME` to name the software provider in these pages.
 
 Generate an encryption key with `python -m app.storage new-key`, keep it outside the data folder, and convert files
 uploaded earlier with `python -m app.storage encrypt-all`.
@@ -188,7 +202,9 @@ and record changes as extensions. ROC dates assume an AGM on 30 September.
 ```
 app/privacy.py      DPDP: consent, rights requests, erasure with legal hold, retention, breaches, checklist
 app/storage.py      encrypted file storage
-app/auth.py         logins, sessions, permissions, client scoping
+app/tenancy.py      firms, memberships, sessions, platform owners, single-office upgrade
+app/google_auth.py  Sign in with Google (OIDC + PKCE)
+app/auth.py         levels, sessions, permissions, client scoping
 app/archive.py      zip extraction (nested, Windows, WhatsApp exports, safety limits) and organised export
 app/ocr.py          Tesseract / Claude-vision OCR and the background worker
 app/whatsapp.py     WhatsApp Cloud API webhook, media download, sending within Meta's rules

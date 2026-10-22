@@ -214,7 +214,7 @@ label.field { display: grid; gap: 4px; font-size: 12px; color: var(--ink-2); fon
 }
 
 /* ---------- auth */
-.auth { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
+.auth-screen { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
 .auth-card { width: min(420px, 100%); padding: 26px 28px; }
 .auth-card form { display: grid; gap: 12px; }
 .auth-card .logo { padding: 0 0 14px; }

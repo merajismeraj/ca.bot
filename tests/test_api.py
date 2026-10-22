@@ -119,7 +119,9 @@ def test_brain_rules_and_proposals(api):
     assert p["payload"]["name"] == "Verma Exports Pvt Ltd" and p["payload"]["turnover_cr"] == 8
     # nothing happens until a human confirms
     assert api.get("/api/clients").json() == []
-    r = api.post("/api/proposals/execute", json=p, headers=api.staff).json()
+    denied = api.post("/api/proposals/execute", json=p, headers=api.staff)
+    assert denied.status_code == 403  # Staff level can't add clients
+    r = api.post("/api/proposals/execute", json=p).json()
     assert r["ok"] and r["client_id"]
     ext = api.post("/api/ask", json={"text": "extend GSTR-9 FY 2025-26 to 31 Jan 2027 per notification 9/2026"}, headers=api.staff).json()
     pl = ext["proposals"][0]["payload"]
@@ -140,3 +142,6 @@ def test_demo_seed_end_to_end(api):
     d = api.get("/api/dashboard", headers=api.partner).json()
     assert d["counts"]["clients"] == 6 and d["counts"]["inbox"] <= 5 and d["counts"]["overdue"] >= 1
     assert api.post("/api/demo", headers=api.partner).status_code == 400
+    team = {u["email"]: u for u in api.get("/api/users").json()}
+    assert not team["priya@demo.local"]["custom_perms"] and team["priya@demo.local"]["perms"] == ["view_documents", "work"]
+    assert team["arjun@demo.local"]["level"] == "manager" and team["arjun@demo.local"]["client_access"] == "all"

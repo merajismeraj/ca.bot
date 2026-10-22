@@ -176,13 +176,20 @@ def process_pending(limit: int = 10) -> int:
 def start_worker() -> None:
     if os.environ.get("CABOT_WORKER", "1") == "0":
         return
-    with db.tx() as c:  # files interrupted mid-read by a restart
-        c.execute("UPDATE documents SET ocr_status='pending' WHERE ocr_status='running'")
+    from . import tenancy
+    for f in tenancy.firms():
+        with db.use_firm(f["id"]):
+            with db.tx() as c:  # files interrupted mid-read by a restart
+                c.execute("UPDATE documents SET ocr_status='pending' WHERE ocr_status='running'")
 
     def loop():
         while True:
             try:
-                if not process_pending():
+                done = 0
+                for f in tenancy.firms("active"):
+                    with db.use_firm(f["id"]):
+                        done += process_pending()
+                if not done:
                     time.sleep(2)
             except Exception:
                 log.exception("OCR worker error")

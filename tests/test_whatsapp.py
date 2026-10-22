@@ -7,8 +7,9 @@ import pytest
 
 @pytest.fixture
 def wa(api, monkeypatch):
-    for k, v in {"WA_TOKEN": "t", "WA_PHONE_NUMBER_ID": "123", "WA_VERIFY_TOKEN": "verify-me", "WA_APP_SECRET": "s3cret"}.items():
+    for k, v in {"WA_TOKEN": "t", "WA_VERIFY_TOKEN": "verify-me", "WA_APP_SECRET": "s3cret"}.items():
         monkeypatch.setenv(k, v)
+    assert api.post("/api/settings", json={"wa_phone_number_id": "123"}).status_code == 200
     api.client = api.post("/api/clients", json={"name": "Sharma Traders", "gstin": "27ABCPS1234K1Z5", "phone": "98200 12345"}).json()
     return api
 
@@ -19,8 +20,8 @@ def signed(body: dict):
     return raw, {"x-hub-signature-256": sig, "content-type": "application/json", "Authorization": ""}
 
 
-def msg(**m):
-    return {"entry": [{"changes": [{"value": {"contacts": [{"wa_id": "919820012345", "profile": {"name": "Rajesh"}}],
+def msg(number="123", **m):
+    return {"entry": [{"changes": [{"value": {"metadata": {"phone_number_id": number}, "contacts": [{"wa_id": "919820012345", "profile": {"name": "Rajesh"}}],
                                               "messages": [{"from": "919820012345", "timestamp": "1", **m}]}}]}]}
 
 
@@ -108,8 +109,24 @@ def test_template_outside_window(wa, monkeypatch):
 
 def test_staff_without_send_permission(wa):
     from app import db
-    wa.patch(f"/api/users/{wa.staff_id}", json={"perms": ["all_clients"]})
+    wa.patch(f"/api/users/{wa.staff_id}", json={"perms": ["work", "view_documents"]})
     with db.tx() as c:
         mid = c.execute("INSERT INTO messages(client_id,channel,body,status,created_at,direction) VALUES(?,?,?,?,?,?)",
                         (wa.client["id"], "whatsapp", "x", "draft", db.now(), "out")).lastrowid
     assert wa.post(f"/api/messages/{mid}", json={"action": "sent"}, headers=wa.staff).status_code == 403
+
+
+def test_messages_routed_to_the_firm_that_owns_the_number(wa, monkeypatch):
+    """Two firms on one platform: a message to firm B's number must never land in firm A."""
+    from conftest import login, make_firm
+    from app import db
+    other = make_firm("Other & Co", owner="boss@other.in")
+    b = login("boss@other.in")
+    wa.post("/api/settings", json={"wa_phone_number_id": "456"}, headers=b)
+    assert wa.post("/api/settings", json={"wa_phone_number_id": "456"}).status_code == 400  # a number belongs to one firm
+    raw, h = signed(msg(number="456", id="mB", type="text", text={"body": "for firm B"}))
+    wa.post("/api/whatsapp/webhook", content=raw, headers=h)
+    raw, h = signed(msg(number="999", id="mX", type="text", text={"body": "unknown number"}))
+    wa.post("/api/whatsapp/webhook", content=raw, headers=h)
+    assert [m["body"] for m in wa.get("/api/messages").json()] == []
+    assert [m["body"] for m in wa.get("/api/messages", headers=b).json()] == ["for firm B"]
