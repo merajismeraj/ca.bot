@@ -176,3 +176,19 @@ def test_single_office_upgrade(tmp_path, monkeypatch):
     assert users["neha@old.in"]["level"] == "owner"
     assert users["ravi@old.in"]["level"] == "staff" and users["ravi@old.in"]["client_access"] == "all"
     assert os.path.exists(doc["stored_path"]) and "/firms/1/" in doc["stored_path"]
+
+
+def test_demo_sandbox(api, monkeypatch):
+    api.headers.pop("Authorization")
+    assert api.post("/api/demo/sandbox").status_code == 404  # off unless enabled (default: only on Vercel)
+    monkeypatch.setenv("CABOT_DEMO_SANDBOX", "1")
+    monkeypatch.setenv("CABOT_EPHEMERAL", "1")
+    st = api.get("/api/auth/state").json()
+    assert st["sandbox"] and st["ephemeral"]
+    r = api.post("/api/demo/sandbox")
+    assert r.status_code == 200 and "cab_session" in r.cookies
+    b = api.get("/api/bootstrap").json()
+    assert b["sandbox"] and b["ephemeral"] and b["me"]["level"] == "owner" and b["has_clients"]
+    assert len(api.get("/api/clients").json()) == 6
+    api.cookies.clear()
+    assert api.get("/api/clients", headers=login("neha@x.in")).json() == []  # the real firm is untouched

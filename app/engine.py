@@ -249,7 +249,7 @@ def ingest(conn, rel_path: str, data: bytes, user: dict | None, batch_id: str, h
         r.client_conf = min(r.client_conf, 0.5)
         r.reasons.insert(0, "This client has withdrawn consent — keep only if the law requires it")
     # scanned / photographed and not identifiable from its name: read it in the background
-    ocr_status = "pending" if r.status == "needs_review" and ocr.needs_ocr(stored, text) else ""
+    ocr_status = "pending" if r.status == "needs_review" and ocr.needs_ocr(stored, text) and ocr.available() else ""
     reasons = (["Reading the scanned page…"] if ocr_status else []) + r.reasons
     cur = conn.execute(
         "INSERT INTO documents(sha256,filename,stored_path,size,text_excerpt,client_id,doc_type,fy,period_start,"

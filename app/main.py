@@ -97,6 +97,7 @@ def auth_state(request: Request):
     """Where the person stands: signed out, signed in without a firm, or inside a firm."""
     s = tenancy.session(auth.token_from(request))
     out = {"google": google_auth.configured(), "google_domain": google_auth.allowed_domain(),
+           "ephemeral": db.ephemeral(), "sandbox": sandbox_enabled(),
            "dev_login": auth.dev_login_enabled(), "signed_in": bool(s), "provider": os.environ.get("CABOT_PROVIDER_NAME", "")}
     if not s:
         return out
@@ -185,6 +186,33 @@ class NewFirmIn(BaseModel):
     accept_terms: bool = False
 
 
+# ============================================================== sandbox
+def sandbox_enabled() -> bool:
+    """A public demo: anyone can open a throwaway firm with sample data, no Google needed.
+    On by default only where storage is temporary anyway (Vercel)."""
+    return os.environ.get("CABOT_DEMO_SANDBOX", "1" if db.ephemeral() else "0") == "1"
+
+
+@app.post("/api/demo/sandbox")
+def demo_sandbox(request: Request, response: Response):
+    if not sandbox_enabled():
+        raise HTTPException(404)
+    key = f"sandbox:{request.client.host if request.client else '-'}"
+    auth.check_rate(key)
+    auth.record_fail(key)  # counts sandboxes per address: at most 10 per 15 minutes
+    from . import seed
+    email = f"demo-{uuid.uuid4().hex[:10]}@sandbox.invalid"
+    f, _ = tenancy.create_firm("Kulkarni & Co. (demo)", email, "Demo Partner", None, "active")
+    with db.use_firm(f["id"]):
+        with db.tx() as c:
+            db.set_setting(c, "sandbox", True)
+        seed.run()
+    token = tenancy.new_session(email, "Demo Partner", None, f["id"],
+                                next(m["user_id"] for m in tenancy.memberships(email)))
+    _set_session_cookie(response, token)
+    return {"ok": True}
+
+
 @app.post("/api/firms")
 async def create_firm(body: NewFirmIn, who: dict = Depends(auth.identity)):
     """Any signed-in Google user can start a firm workspace; they become its super admin.
@@ -264,6 +292,8 @@ def bootstrap(request: Request, user: dict = Depends(auth.current)):
             "my_firms": [{"id": m["firm_id"], "name": m["firm_name"], "status": m["status"]}
                          for m in tenancy.memberships(user["email"])],
             "is_platform_admin": tenancy.is_admin(user["email"]),
+            "ephemeral": db.ephemeral(),
+            "sandbox": bool(db.get_setting(c, "sandbox", False)),
             "users": [auth.public(u) for u in db.rows(c, "SELECT * FROM users WHERE active=1 ORDER BY id")],
             "perms": auth.PERMS,
             "levels": {k: {"label": v[0], "perms": auth.level_perms(c)[k], "client_access": v[2]} for k, v in auth.LEVELS.items()},

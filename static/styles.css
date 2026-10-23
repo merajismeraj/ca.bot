@@ -238,3 +238,6 @@ details summary { cursor: pointer; }
 .btn.google { justify-content: center; gap: 10px; padding: 9px 12px; font-weight: 600; }
 .or { display: flex; align-items: center; gap: 10px; color: var(--ink-3); font-size: 12px; }
 .or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+
+.demo-banner { background: var(--amber-soft); color: var(--amber); font-size: 13px; font-weight: 600; padding: 8px 28px; border-bottom: 1px solid var(--line); }
+@media (max-width: 960px) { .demo-banner { padding: 8px 16px; } }

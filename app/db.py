@@ -17,7 +17,14 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-DATA_DIR = Path(os.environ.get("CABOT_DATA", Path(__file__).resolve().parent.parent / "data"))
+# On Vercel only /tmp is writable, and it is wiped whenever an instance is recycled (see ephemeral()).
+DATA_DIR = Path(os.environ.get("CABOT_DATA") or ("/tmp/cabot" if os.environ.get("VERCEL") else
+                                                 Path(__file__).resolve().parent.parent / "data"))
+
+
+def ephemeral() -> bool:
+    """True when storage does not survive restarts (Vercel functions): the app shows a demo-only warning."""
+    return os.environ.get("CABOT_EPHEMERAL", "1" if os.environ.get("VERCEL") else "0") == "1"
 
 _firm: contextvars.ContextVar[int | None] = contextvars.ContextVar("firm", default=None)
 

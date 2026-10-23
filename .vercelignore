@@ -1,0 +1,7 @@
+tests/
+data/
+.venv/
+.pytest_cache/
+**/__pycache__/
+Dockerfile
+requirements-dev.txt

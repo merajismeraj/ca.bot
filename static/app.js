@@ -1040,8 +1040,16 @@ async function showAuth(chooser) {
         post("/api/auth/dev-login", { email: email.value }).then(() => showAuth()).catch(x => err.textContent = x.message); } },
         h("div", { class: "or" }, h("span", {}, "developer sign-in (this computer only)")), email, h("button", { class: "btn", type: "submit" }, "Sign in without Google"));
     })() : null;
-    return card(h("h1", {}, "Sign in"), h("p", { class: "muted" }, "Use the Google account your firm added you with."),
+    const demoBtn = st.sandbox ? h("button", { class: "btn primary", style: "justify-content:center", onclick: async e => {
+      e.target.disabled = true; e.target.textContent = "Setting up a demo firm…"; err.textContent = "";
+      try { await post("/api/demo/sandbox", {}); await enter(); } catch (x) { err.textContent = x.message; e.target.disabled = false; e.target.textContent = "Try the demo firm"; }
+    } }, "Try the demo firm") : null;
+    return card(
+      st.ephemeral ? h("div", { class: "banner warn", style: "margin:0 0 4px" }, "Demo environment: data is temporary and can disappear at any time. Don't upload real client data.") : null,
+      h("h1", {}, "Sign in"), h("p", { class: "muted" }, "Use the Google account your firm added you with."),
+      demoBtn, demoBtn && st.google ? h("div", { class: "or" }, h("span", {}, "or")) : null,
       st.google ? h("a", { class: "btn google", href: "/api/auth/google/start" }, googleMark(), "Continue with Google")
+        : st.sandbox ? h("div", { class: "small muted" }, "Sign in with Google is coming soon on this site.")
         : h("div", { class: "banner warn", style: "margin:0" }, "Google sign-in isn't configured on this server yet. The administrator needs to set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET."),
       st.google_domain ? h("div", { class: "small muted", style: "text-align:center" }, `Use your @${st.google_domain} account`) : null,
       dev, err, legal);
@@ -1193,6 +1201,9 @@ async function boot() {
   S.me = S.boot.me;
   $("#auth") && $("#auth").remove();
   document.querySelector(".shell").classList.remove("hidden");
+  $("#demo-banner") && $("#demo-banner").remove();
+  if (S.boot.ephemeral) document.querySelector(".main").prepend(h("div", { id: "demo-banner", class: "demo-banner" },
+    S.boot.sandbox ? "You're in a demo firm with sample data. " : "", "Demo environment — data is temporary and can disappear at any time. Don't upload real client data."));
   await route();
 }
 
