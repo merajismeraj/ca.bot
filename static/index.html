@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CA Brain</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='9' fill='%233b5bdb'/><text x='16' y='22' font-size='16' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='700'>₹</text></svg>">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="side">
+      <div class="logo"><div class="logo-mark">₹</div><div><span id="firm-name">CA Brain</span><small>Company brain</small></div></div>
+      <nav class="nav" id="nav"></nav>
+      <div class="side-foot" id="side-foot"></div>
+    </aside>
+    <main class="main">
+      <div class="top">
+        <div class="ask" id="ask">
+          <span class="spark">✦</span>
+          <input id="ask-input" autocomplete="off" placeholder="Ask or instruct — “what's due this week”, “chase Sharma”, “extend GSTR-9 to 31 Jan 2027”">
+          <kbd>/</kbd>
+          <div class="ask-panel hidden" id="ask-panel"></div>
+        </div>
+        <div id="fy-chip" class="hide-sm"></div>
+      </div>
+      <div class="page" id="page"></div>
+    </main>
+  </div>
+  <div class="toasts" id="toasts"></div>
+  <input type="file" id="file-input" multiple class="hidden">
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+.legal { max-width: 780px; margin: 0 auto; padding: 32px 20px 80px; line-height: 1.65; }
+.legal header { margin-bottom: 18px; }
+.legal h1 { font-size: 28px; margin: 10px 0 4px; }
+.legal h2 { font-size: 18px; margin: 30px 0 8px; scroll-margin-top: 16px; }
+.legal .lead { font-size: 15px; }
+.legal ul { padding-left: 20px; }
+.legal li { margin: 4px 0; }
+.legal dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+.legal dt { color: var(--ink-3); }
+.legal dd { margin: 0; }
+.legal .toc { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 12px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; font-size: 13px; }
+.todo { background: var(--amber-soft); color: var(--amber); border-radius: 4px; padding: 0 4px; font-weight: 600; }
+@media (max-width: 600px) { .legal dl { grid-template-columns: 1fr; } }
+body[data-scope="platform"] .firm-only, body:not([data-scope="platform"]) .platform-only { display: none; }
